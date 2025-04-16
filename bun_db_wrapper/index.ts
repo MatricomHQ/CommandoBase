@@ -49,9 +49,9 @@ async function forwardRequest(
              // Assuming body is already in a suitable format (string/Buffer) if not JSON
              reqBody = body as string | Buffer;
              console.log(`[Gateway] Forwarding body with Content-Type: ${contentType}`);
-        }
-    } else {
+        } else {
          console.log("[Gateway] Forwarding request with no body.");
+        }
     }
 
     try {
@@ -158,11 +158,29 @@ serve({
     switch (url.pathname) {
         case "/set":
             if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-            return forwardRequest("/set", "POST", body, "application/json");
+            // Auto serialize to JSON if it's not a string
+            const setBody = typeof body === 'string' ? body : JSON.stringify(body);
+            return forwardRequest("/set", "POST", setBody, "application/json");
 
         case "/get":
             if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-            return forwardRequest("/get", "POST", body, "application/json");
+            const getResponse = await forwardRequest("/get", "POST", body, "application/json");
+            if (!getResponse.ok) return getResponse; // Propagate errors
+            try {
+                const getText = await getResponse.text();
+                // Auto parse JSON if it's a valid JSON string
+                const parsed = JSON.parse(getText);
+                return new Response(JSON.stringify(parsed), { // Re-stringify to ensure correct content type
+                    status: getResponse.status,
+                    headers: getResponse.headers,
+                });
+            } catch (e) {
+                console.error("[Gateway] Failed to parse JSON from backend:", e);
+                return getResponse; // Return original response if parsing fails
+            }
+        case "/query/field":
+            if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+            return forwardRequest("/query/field", "POST", body, "application/json");
 
         case "/delete":
             if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -178,7 +196,18 @@ serve({
 
         case "/export":
             if (req.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
-            return forwardRequest("/export", "GET", null, null);
+            const exportResponse = await forwardRequest("/export", "GET", null, null);
+            if (!exportResponse.ok) return exportResponse; // Propagate errors
+            try {
+                const exportText = await exportResponse.text();
+                 return new Response(JSON.stringify(JSON.parse(exportText)), { // Re-stringify to ensure correct content type
+                    status: exportResponse.status,
+                    headers: exportResponse.headers,
+                });
+            } catch (e) {
+                console.error("[Gateway] Failed to parse JSON from backend:", e);
+                return exportResponse; // Return original response if parsing fails
+            }
 
         case "/import":
             if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
