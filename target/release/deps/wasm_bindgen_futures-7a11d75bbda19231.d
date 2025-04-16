@@ -1,0 +1,9 @@
+/Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/target/release/deps/libwasm_bindgen_futures-7a11d75bbda19231.rmeta: /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/lib.rs /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/queue.rs /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/task/singlethread.rs
+
+/Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/target/release/deps/libwasm_bindgen_futures-7a11d75bbda19231.rlib: /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/lib.rs /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/queue.rs /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/task/singlethread.rs
+
+/Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/target/release/deps/wasm_bindgen_futures-7a11d75bbda19231.d: /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/lib.rs /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/queue.rs /Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/task/singlethread.rs
+
+/Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/lib.rs:
+/Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/queue.rs:
+/Users/kristopherbaylog/.cargo/registry/src/index.crates.io-6f17d22bba15001f/wasm-bindgen-futures-0.4.50/src/task/singlethread.rs:

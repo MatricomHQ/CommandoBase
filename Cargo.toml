@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/logic",
+    "crates/wasm",
+    "crates/server",
+]
+
+# Optional: Define shared workspace dependencies or profiles if needed later
+# [workspace.dependencies]
+# serde = { version = "1.0", features = ["derive"] }
+
+# [profile.release]
+# inherits = "release" # Inherit from default release profile
+# lto = true
+# opt-level = 'z'

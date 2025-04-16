@@ -1,0 +1,22 @@
+[package]
+name = "rust_db_wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rust_db_logic = { path = "../logic" } # Depend on the local logic crate
+wasm-bindgen = { version = "0.2.100", features = ["serde-serialize"] }
+serde = { version = "1.0.219", features = ["derive"] } # Needed for passing data
+serde_json = "1.0.140" # For potential JSON handling at boundary
+serde-wasm-bindgen = "0.6"
+thiserror = "1.0" # For error handling consistency (optional here)
+tracing = "0.1"
+sled = "0.34.7" # Added sled dependency
+wasm-bindgen-futures = "0.4" # Add wasm-bindgen-futures for async support
+
+[profile.release]
+lto = true
+opt-level = 'z'
