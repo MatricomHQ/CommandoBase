@@ -2,18 +2,18 @@ use axum::{
     routing::{get, post},
     Router,
     response::{IntoResponse, Response, Json},
-    http::StatusCode,
-    extract::State,
+    http::{StatusCode, Request, header::{HeaderName, HeaderValue}}, // Corrected header import
+    extract::{State, FromRequestParts},
+    middleware::{self, Next},
+    body::Body, // Import Body
 };
 use rust_db_logic::{
     self as logic,
     export_data,
-    // import_data, // Removed unused import
     DbConfig as LogicDbConfig,
     BatchSetItem,
     TransactionOperation,
     QueryNode,
-    // DbError, // Removed unused import
 };
 use serde::{Serialize, Deserialize};
 use serde_json::{Value, json};
@@ -21,17 +21,20 @@ use sled::{Db, Config};
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::fs;
-// use std::collections::HashSet; // Removed unused import
+use std::env;
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{info, error, Level, instrument};
+use tracing::{info, error, warn, Level, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::Parser;
 use thiserror::Error;
-use std::sync::Mutex; // Import Mutex
+use std::sync::Mutex;
+use rand::{distributions::Alphanumeric, Rng};
 
 const DEFAULT_BASE_PATH: &str = "database_data_server";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8989";
+const API_KEY_HEADER: &str = "X-API-Key";
+const API_KEY_HEADER_LOWERCASE: &str = "x-api-key"; // Lowercase version
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -42,13 +45,15 @@ struct Args {
     db_name: String,
     #[arg(short, long, env = "LISTEN_ADDR", value_name = "HOST:PORT", default_value = DEFAULT_LISTEN_ADDR)]
     listen_addr: String,
-
+    #[arg(long, env = "DB_API_KEY")] // Reads from --api-key OR DB_API_KEY env var
+    api_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct AppState {
     db: Arc<Db>,
-    db_config: Arc<Mutex<LogicDbConfig>>, // Wrap in Mutex
+    db_config: Arc<Mutex<LogicDbConfig>>,
+    api_key: Arc<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -62,13 +67,11 @@ struct SetPayload {
     value: Value,
 }
 
-
 #[derive(Deserialize, Debug)]
 struct GetPartialPayload {
     key: String,
     fields: Vec<String>,
 }
-
 
 #[derive(Deserialize, Debug)]
 struct QueryRadiusPayload {
@@ -96,8 +99,8 @@ struct QueryAndPayload {
 struct QueryAstPayload {
     ast: logic::QueryNode,
     projection: Option<Vec<String>>,
-    limit: Option<usize>, // Added
-    offset: Option<usize>, // Added
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -107,8 +110,6 @@ struct ImportItem {
 }
 
 type ImportPayload = Vec<ImportItem>;
-
-// New Payloads
 type BatchSetPayload = Vec<BatchSetItem>;
 type TransactionPayload = Vec<TransactionOperation>;
 
@@ -117,12 +118,11 @@ struct ClearPrefixPayload {
     prefix: String,
 }
 
-#[derive(Serialize)] // For response
+#[derive(Serialize)]
 struct CountResponse {
     count: usize,
 }
 
-// Modified: Take a reference to QueryNode
 fn extract_eq_field(query_node: &QueryNode) -> Option<String> {
     match query_node {
         QueryNode::Eq(field, _, _) => Some(field.clone()),
@@ -146,6 +146,29 @@ fn add_field_to_index(db_config: &mut LogicDbConfig, field_path: &str) {
     }
 }
 
+// Corrected middleware signature
+async fn api_key_auth(
+    State(state): State<AppState>,
+    req: Request<Body>, // Use axum::body::Body
+    next: Next, // Remove generic parameter
+) -> Result<Response, AppError> {
+    let headers = req.headers();
+    // Use HeaderName::from_static for efficiency
+    let api_key_header_name = HeaderName::from_static(API_KEY_HEADER_LOWERCASE);
+
+    if let Some(provided_key) = headers.get(&api_key_header_name).and_then(|value| value.to_str().ok()) {
+        if provided_key == state.api_key.as_str() {
+            Ok(next.run(req).await) // Pass the original req
+        } else {
+            warn!("Invalid API Key provided");
+            Err(AppError::Unauthorized)
+        }
+    } else {
+        warn!("Missing API Key header: {}", API_KEY_HEADER);
+        Err(AppError::Unauthorized)
+    }
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -156,6 +179,31 @@ async fn main() {
         }))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    let api_key = match args.api_key.or_else(|| env::var("DB_API_KEY").ok()) {
+        Some(key) => {
+            if key.is_empty() {
+                 error!("Provided API Key (via --api-key or DB_API_KEY) cannot be empty.");
+                 std::process::exit(1);
+            }
+            info!("Using provided API Key.");
+            key
+        }
+        None => {
+            let generated_key: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+            warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            warn!("!!! WARNING: No API Key provided via --api-key or DB_API_KEY environment variable.");
+            warn!("!!! Generating a random API Key for this session:");
+            warn!("!!! {}", generated_key);
+            warn!("!!! Use this key in the '{}' header for requests.", API_KEY_HEADER);
+            warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            generated_key
+        }
+    };
 
     info!("Ensuring base directory exists at {:?}", args.base_path);
     if let Err(e) = fs::create_dir_all(&args.base_path) {
@@ -180,37 +228,42 @@ async fn main() {
         }
     };
 
-
-    // Configure DbConfig with hash index for 'type' field
     let db_config = Arc::new(Mutex::new(LogicDbConfig::default()));
     info!("Using default DbConfig: {:?}", db_config);
 
+    let app_state = AppState {
+        db,
+        db_config,
+        api_key: Arc::new(api_key),
+    };
 
-    let app_state = AppState { db, db_config };
-
-    let app = Router::new()
-        .route("/", get(health_check))
+    let api_routes = Router::new()
         .route("/set", post(set_handler))
         .route("/get", post(get_handler))
         .route("/get_partial", post(get_partial_handler))
         .route("/delete", post(delete_handler))
-        .route("/batch_set", post(batch_set_handler)) // New
-        .route("/transaction", post(transaction_handler)) // New
-        .route("/clear_prefix", post(clear_prefix_handler)) // New
-        .route("/drop_database", post(drop_database_handler)) // New
+        .route("/batch_set", post(batch_set_handler))
+        .route("/transaction", post(transaction_handler))
+        .route("/clear_prefix", post(clear_prefix_handler))
+        .route("/drop_database", post(drop_database_handler))
         .route("/query/radius", post(query_radius_handler))
         .route("/query/box", post(query_box_handler))
         .route("/query/and", post(query_and_handler))
         .route("/query/ast", post(query_ast_handler))
         .route("/export", get(export_handler))
         .route("/import", post(import_handler))
+        .route_layer(middleware::from_fn_with_state(app_state.clone(), api_key_auth));
+
+    let app = Router::new()
+        .route("/", get(health_check)) // Health check doesn't need auth
+        .merge(api_routes)
         .with_state(app_state.clone())
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(tower_http::trace::DefaultOnResponse::new().level(Level::INFO).latency_unit(tower_http::LatencyUnit::Micros)),
         )
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive()); // Consider making CORS more restrictive
 
     info!("Attempting to bind listener to {}", args.listen_addr);
     let listener = match TcpListener::bind(&args.listen_addr).await {
@@ -247,8 +300,6 @@ async fn set_handler(
     Json(payload): Json<SetPayload>,
 ) -> Result<StatusCode, AppError> {
     let db_config_guard = state.db_config.lock().unwrap();
-    // Note: Dynamic indexing on set is complex as we don't know which fields *will* be queried.
-    // For now, indexing happens primarily during query.
     logic::set_key(&state.db, &payload.key, payload.value, &db_config_guard)?;
     Ok(StatusCode::OK)
 }
@@ -262,7 +313,6 @@ async fn get_handler(
     Ok(Json(value))
 }
 
-
 #[instrument(skip(state, payload), fields(handler="get_partial_handler"))]
 async fn get_partial_handler(
     State(state): State<AppState>,
@@ -272,32 +322,28 @@ async fn get_partial_handler(
     Ok(Json(value))
 }
 
-
 #[instrument(skip(state, payload), fields(handler="delete_handler"))]
 async fn delete_handler(
     State(state): State<AppState>,
     Json(payload): Json<KeyPayload>,
 ) -> Result<StatusCode, AppError> {
-    // Clone config inside lock, drop lock before await
     let config_clone = {
         let guard = state.db_config.lock().unwrap();
         let config_clone = guard.clone();
-        drop(guard); // Explicitly drop the lock
+        drop(guard);
         config_clone
     };
     logic::delete_key(&state.db, &payload.key, &config_clone).await?;
     Ok(StatusCode::OK)
 }
 
-// New Handlers
 #[instrument(skip(state, payload), fields(handler="batch_set_handler"))]
 async fn batch_set_handler(
     State(state): State<AppState>,
     Json(payload): Json<BatchSetPayload>,
 ) -> Result<StatusCode, AppError> {
     let db_config_guard = state.db_config.lock().unwrap();
-    // Dynamic indexing on batch set is also complex. Indexing on query is preferred.
-    logic::batch_set(&state.db, &payload, &db_config_guard)?; // Pass slice
+    logic::batch_set(&state.db, &payload, &db_config_guard)?;
     Ok(StatusCode::OK)
 }
 
@@ -307,7 +353,7 @@ async fn transaction_handler(
     Json(payload): Json<TransactionPayload>,
 ) -> Result<StatusCode, AppError> {
     let db_config_guard = state.db_config.lock().unwrap();
-    logic::execute_transaction(&state.db, &payload, &db_config_guard)?; // Pass slice
+    logic::execute_transaction(&state.db, &payload, &db_config_guard)?;
     Ok(StatusCode::OK)
 }
 
@@ -330,14 +376,11 @@ async fn drop_database_handler(
     Ok(Json(CountResponse { count }))
 }
 
-
 #[instrument(skip(state, payload), fields(handler="query_radius_handler"))]
 async fn query_radius_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryRadiusPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-    // Geo queries might also benefit from dynamic indexing, but requires more complex logic
-    // to determine if the field should be geo-indexed. Sticking to hash for now.
     let results = logic::query_within_radius_simplified(&state.db, &payload.field, payload.lat, payload.lon, payload.radius)?;
     Ok(Json(results))
 }
@@ -356,8 +399,6 @@ async fn query_and_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryAndPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-    // Dynamic indexing for AND conditions requires iterating through conditions
-    // and potentially updating the config multiple times.
     let conditions: Vec<(&str, &str, &str)> = payload.conditions.iter()
         .map(|(field, op, value)| (field.as_str(), op.as_str(), value.as_str()))
         .collect();
@@ -373,18 +414,16 @@ async fn query_ast_handler(
     let field_to_index = &payload.ast;
     let field_option = extract_eq_field(field_to_index);
 
-    // Clone config, potentially update it, drop lock before await/logic call
     let config_clone = {
         let mut db_config_guard = state.db_config.lock().unwrap();
         if let Some(field) = field_option {
             add_field_to_index(&mut db_config_guard, &field);
         }
         let config_clone = db_config_guard.clone();
-        drop(db_config_guard); // Explicitly drop the lock
+        drop(db_config_guard);
         config_clone
     };
 
-    // Pass the potentially updated, cloned config
     let results = logic::execute_ast_query(&state.db, payload.ast, payload.projection, payload.limit, payload.offset, &config_clone)?;
     Ok(Json(results))
 }
@@ -413,6 +452,8 @@ enum AppError {
     Logic(#[from] logic::DbError),
     #[error("JSON Error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Unauthorized: Missing or invalid API key")]
+    Unauthorized,
 }
 
 impl IntoResponse for AppError {
@@ -439,9 +480,10 @@ impl IntoResponse for AppError {
                 logic::DbError::AstQueryError(msg) => (StatusCode::BAD_REQUEST, format!("AST Query Error: {}", msg)),
                 logic::DbError::InvalidPath(path) => (StatusCode::BAD_REQUEST, format!("Invalid path specified: {}", path)),
                 logic::DbError::TransactionOperationFailed(msg) => (StatusCode::CONFLICT, format!("Transaction failed: {}", msg)),
-                logic::DbError::InvalidFieldIndexKey(key) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid field index key format: {}", key)), // Added arm
+                logic::DbError::InvalidFieldIndexKey(key) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid field index key format: {}", key)),
             },
             AppError::Json(json_err) => (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", json_err)),
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized: Missing or invalid API key".to_string()),
         };
         error!("Error processing request: {}", self);
         (status, Json(json!({ "error": error_message }))).into_response()

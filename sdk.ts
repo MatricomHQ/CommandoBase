@@ -84,6 +84,7 @@ export interface DatabaseConfig {
     port: number;
     protocol?: 'http' | 'https';
     cacheTTL?: number;
+    apiKey?: string; // Added API key
 }
 
 class DatabaseError extends Error {
@@ -318,6 +319,7 @@ export class Database {
   private cacheTTL: number;
   private subscriptions: { [key: string]: Array<() => void> };
   private eventSource?: EventSource;
+  private apiKey?: string; // Store API Key
 
   constructor(config?: Partial<DatabaseConfig>) {
     const conf: DatabaseConfig = {
@@ -325,6 +327,7 @@ export class Database {
         port: config?.port ?? 8989,
         protocol: config?.protocol ?? 'http',
         cacheTTL: config?.cacheTTL ?? 5000,
+        apiKey: config?.apiKey, // Store API Key
     };
 
     if (!conf.host) {
@@ -338,6 +341,7 @@ export class Database {
     this.cache = new Map();
     this.cacheTTL = conf.cacheTTL ?? 5000;
     this.subscriptions = {};
+    this.apiKey = conf.apiKey; // Store API Key
     console.info(`Database SDK initialized for server at: ${this.baseURL}`);
     this.initializeEventSource(); // Uncommented this line
   }
@@ -381,11 +385,17 @@ export class Database {
     const start = performance.now();
     console.debug(`Sending ${method} request to ${url}`, method === 'POST' ? body : '');
     try {
+      const headers: HeadersInit = {
+        'Content-Type': 'application/json',
+      };
+
+      if (this.apiKey) {
+        headers['X-API-Key'] = this.apiKey; // Add API Key header
+      }
+
       const response = await fetch(url, {
         method: method,
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: headers,
         body: method === 'POST' ? JSON.stringify(body) : undefined,
       });
 

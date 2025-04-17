@@ -16,3 +16,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sled = { version = "0.34.7", features = ["compression"] }
 geo = { version = "0.30.0", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] } # Added clap with derive and env features
+rand = "0.8"

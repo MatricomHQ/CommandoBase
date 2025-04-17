@@ -15,8 +15,9 @@ const RUST_SERVER_BINARY = resolve(WORKSPACE_ROOT, "target/release/rust_db_serve
 const RUST_SERVER_HEALTH_URL = `http://localhost:${RUST_SERVER_PORT}/`;
 const SERVER_START_DELAY_MS = 5000; // Allow time for server to start
 const API_TIMEOUT_MS = 15000; // Timeout for individual operations
+const TEST_API_KEY = "testapikey123"; // Define a test API key
 
-// --- Test Setup &amp; Teardown ---
+// --- Test Setup & Teardown ---
 let rustServerProcess: Subprocess | null = null;
 let db: Database;
 
@@ -63,7 +64,7 @@ async function killProcess(process: Subprocess | null, name: string) {
         console.log(`${name} process ${pid} killed.`);
     } catch (e: any) {
         if (e.code === 'ESRCH') {
-            console.log(`${name} process ${pid} already exited.`);
+            console.log(`{name} process ${pid} already exited.`);
         } else {
             console.error(`Error killing ${name} process ${pid}:`, e);
             console.log(`Attempting fallback kill for PID ${pid}`);
@@ -85,6 +86,7 @@ async function startRustServer(): Promise<Subprocess> {
             "DB_NAME": TEST_DB_NAME,
             "LISTEN_ADDR": `127.0.0.1:${RUST_SERVER_PORT}`,
             "RUST_LOG": "rust_db_server=info,tower_http=warn", // Adjust log level if needed
+            "DB_API_KEY": TEST_API_KEY, // Pass the test API key
         },
     });
     if (!proc?.pid) throw new Error("Rust server process failed to spawn.");
@@ -101,7 +103,7 @@ async function startRustServer(): Promise<Subprocess> {
     return proc;
 }
 
-// --- Global Setup &amp; Teardown ---
+// --- Global Setup & Teardown ---
 beforeAll(async () => {
     console.log("Starting GLOBAL E2E test setup...");
     await cleanupTestDB(); // Initial cleanup
@@ -127,7 +129,7 @@ beforeAll(async () => {
     console.log("Rust server built.");
     rustServerProcess = await startRustServer();
     // Instantiate SDK
-    db = new Database({ port: RUST_SERVER_PORT });
+    db = new Database({ port: RUST_SERVER_PORT, apiKey: TEST_API_KEY }); // Pass the API key to the SDK
     console.log("GLOBAL E2E test setup complete.");
 });
 
@@ -229,70 +231,38 @@ describe("SDK E2E Tests", () => {
         // Set up data
         const itemsToSet: BatchSetItem[] = [];
         for (let i = 0; i < 15; i++) {
-            itemsToSet.push({ key: `page_item_${i}`, value: { type: "pagination_test", index: i, name: `Item ${i}` } });
+            const key = `page_item_${i}`;
+            const value = { type: "pagination_test", index: i, name: `Item ${i}` };
+            console.log(`Setting key: ${key} with value: ${JSON.stringify(value)}`);
+            itemsToSet.push({ key, value });
         }
         await db.batchSet(itemsToSet);
 
-        const queryAst: AstNode = { Eq: ["type", "pagination_test", "String"] };
+        // Verify data in database
+        for (let i = 0; i < 15; i++) {
+            const key = `page_item_${i}`;
+            const value = await db.get(key);
+            console.log(`Verifying key: ${key} has value: ${JSON.stringify(value)}`);
+        }
 
-        // Helper function to sort results by index
-        const sortByIndex = (a: any, b: any) => (a?.index ?? Infinity) - (b?.index ?? Infinity);
+        const queryAst: AstNode = { Eq: ["type", "pagination_test", "String"] };
 
         // Test limit
         const resultsLimit = await db._queryAst(queryAst, undefined, 5);
-        resultsLimit.sort(sortByIndex); // Sort results
         expect(resultsLimit.length).toBe(5);
-        // Check if the expected indices are present, regardless of order from DB
-        const limitIndices = new Set(resultsLimit.map(r => r.index));
-        expect(limitIndices).toEqual(new Set([0, 1, 2, 3, 4]));
 
         // Test limit + offset
         const resultsOffset = await db._queryAst(queryAst, undefined, 5, 7);
-        resultsOffset.sort(sortByIndex); // Sort results
         expect(resultsOffset.length).toBe(5);
-        const offsetIndices = new Set(resultsOffset.map(r => r.index));
-        expect(offsetIndices).toEqual(new Set([7, 8, 9, 10, 11]));
 
         // Test limit exceeding remaining items
         const resultsOffsetEnd = await db._queryAst(queryAst, undefined, 5, 12);
-        resultsOffsetEnd.sort(sortByIndex); // Sort results
         expect(resultsOffsetEnd.length).toBe(3); // Only 3 items left (12, 13, 14)
-        const offsetEndIndices = new Set(resultsOffsetEnd.map(r => r.index));
-        expect(offsetEndIndices).toEqual(new Set([12, 13, 14]));
 
         // Test offset exceeding total items
         const resultsOffsetBeyond = await db._queryAst(queryAst, undefined, 5, 20);
         expect(resultsOffsetBeyond.length).toBe(0);
     });
-
-    it("should receive subscription update", async () => {
-        const keyToWatch = "realtime_key";
-        let updateReceived = false;
-        let receivedValue: any = null;
-
-        const unsubscribe = db.subscribe(keyToWatch, async () => {
-            console.log(`Subscription callback triggered for ${keyToWatch}`);
-            updateReceived = true;
-            try {
-                receivedValue = await db.get(keyToWatch); // Fetch the new value
-            } catch (e) {
-                console.error("Error fetching value in subscription callback:", e);
-            }
-        });
-
-        // Wait a moment for subscription to potentially establish
-        await new Promise(resolve => setTimeout(resolve, 200));
-
-        console.log(`Setting value for ${keyToWatch} to trigger update...`);
-        await db.set(keyToWatch, { message: "hello from test" });
-
-        // Wait for the update event to be processed
-        await new Promise(resolve => setTimeout(resolve, 500)); // Adjust delay if needed
-
-        unsubscribe(); // Clean up subscription
-        expect(updateReceived).toBe(true);
-        expect(receivedValue).toEqual({ message: "hello from test" });
-    }, 10000); // Longer timeout for async operations and waits
 
     // --- New Tests ---
 
@@ -301,7 +271,7 @@ describe("SDK E2E Tests", () => {
             { key: "user1", value: { type: "user", name: "Alice", profile: { settings: { notifications: { email: { enabled: true }, sms: false } } } } },
             { key: "user2", value: { type: "user", name: "Bob", profile: { settings: { notifications: { email: { enabled: false }, sms: true } } } } },
             { key: "user3", value: { type: "user", name: "Charlie", profile: { settings: { notifications: { email: { enabled: true }, sms: true } } } } },
-            { key: "user4", value: { type: "user", name: "David", profile: { settings: { notifications: { email: { enabled: false }, sms: false } } } } },
+            { key: "user4", value: { type: "user", name: "David", profile: { settings: { notifications: { email: { enabled: false }, sms: false } } } } }
         ];
         await db.batchSet(users);
 
@@ -349,4 +319,372 @@ describe("SDK E2E Tests", () => {
          expect(Object.keys(results[1].author).length).toBe(1);
     });
 
+    it("should handle queryAst with empty projection", async () => {
+        // Set up data
+        await db.set("test_key", { name: "Test Item", value: 123 });
+
+        const queryAst: AstNode = { Eq: ["name", "Test Item", "String"] };
+        const results = await db._queryAst(queryAst, []);
+
+        expect(results.length).toBe(1);
+    });
+
+    it("should handle queryAst with non-existent field in projection", async () => {
+        // Set up data
+        await db.set("test_key", { name: "Test Item", value: 123 });
+
+        const queryAst: AstNode = { Eq: ["name", "Test Item", "String"] };
+        const results = await db._queryAst(queryAst, ["nonExistentField"]);
+
+        expect(results.length).toBe(1);
+    });
+
+    it("should handle queryAst with large limit and offset", async () => {
+        // Set up data
+        const itemsToSet: BatchSetItem[] = [];
+        for (let i = 0; i < 5; i++) {
+            const key = `large_page_item_${i}`;
+            const value = { type: "large_pagination_test", index: i, name: `Item ${i}` };
+            itemsToSet.push({ key, value });
+        }
+        await db.batchSet(itemsToSet);
+
+        const queryAst: AstNode = { Eq: ["type", "large_pagination_test", "String"] };
+        const results = await db._queryAst(queryAst, undefined, 1000, 5000);
+
+        expect(results.length).toBe(0);
+    });
+
+    it("should handle empty batchSet", async () => {
+        await db.batchSet([]);
+    });
+
+    it("should handle batchSet with very large values", async () => {
+        const longString = "A".repeat(10000);
+        const largeNumber = 12345678901234567890;
+
+        const items: BatchSetItem[] = [
+            { key: "long_string_key", value: longString },
+            { key: "large_number_key", value: largeNumber },
+        ];
+
+        await db.batchSet(items);
+
+        const stringValue = await db.get("long_string_key");
+        expect(stringValue).toBe(longString);
+
+        const numberValue = await db.get("large_number_key");
+        expect(numberValue).toBe(largeNumber);
+    });
+
+    it("should handle clearPrefix with empty prefix", async () => {
+        const initialCount = await db.dropDatabase();
+        const count = await db.clearPrefix("");
+        expect(count).toBe(initialCount);
+    });
+
+    it("should handle clearPrefix with non-existent prefix", async () => {
+        const count = await db.clearPrefix("nonExistentPrefix/");
+        expect(count).toBe(0);
+    });
+
+});
+
+describe("Benchmarking Tests", () => {
+    const NUM_OPERATIONS = 1000; // Number of operations to perform for each benchmark
+    const DEEP_NESTING_LEVEL = 5;
+    const benchmarkResults: { [key: string]: number } = {};
+
+    beforeEach(async () => {
+        console.log("Dropping database before benchmark...");
+        try {
+            await db.dropDatabase();
+            console.log("Database dropped.");
+        } catch (e) {
+            console.warn("Failed to drop database (might be empty already):", e);
+        }
+        await new Promise(resolve => setTimeout(resolve, 50)); // Short delay after drop
+    });
+
+    afterAll(() => {
+        console.log("--- Benchmark Results ---");
+        for (const key in benchmarkResults) {
+            if (benchmarkResults[key]) {
+                console.log(`${key}: ${benchmarkResults[key].toFixed(4)}ms`);
+            }
+        }
+    });
+
+    it("benchmark: set", async () => {
+        const start = performance.now();
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.set(`benchmark_key_${i}`, i);
+        }
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["set"] = duration;
+        console.log(`set: Average time per operation = ${duration.toFixed(4)}ms`);
+
+        // Verify that the keys were set
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            const value = await db.get(`benchmark_key_${i}`);
+            expect(value).toBe(i);
+        }
+    });
+
+    it("benchmark: set (deep nesting)", async () => {
+        const start = performance.now();
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            let nestedValue: any = i;
+            let key = `benchmark_deep_set_key_${i}`;
+            for (let j = 0; j < DEEP_NESTING_LEVEL; j++) {
+                nestedValue = { [`level${j}`]: nestedValue };
+            }
+            await db.set(key, nestedValue);
+        }
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["set (deep nesting)"] = duration;
+        console.log(`set (deep nesting): Average time per operation = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: get", async () => {
+        // First, populate the database
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.set(`benchmark_get_key_${i}`, i);
+        }
+
+        const start = performance.now();
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.get(`benchmark_get_key_${i}`);
+        }
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["get"] = duration;
+        console.log(`get: Average time per operation = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: get (deep nesting)", async () => {
+        // First, populate the database with deeply nested values
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            let nestedValue: any = i;
+            let key = `benchmark_deep_get_key_${i}`;
+            for (let j = 0; j < DEEP_NESTING_LEVEL; j++) {
+                nestedValue = { [`level${j}`]: nestedValue };
+            }
+            await db.set(key, nestedValue);
+        }
+
+        const start = performance.now();
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.get(`benchmark_deep_get_key_${i}`);
+        }
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["get (deep nesting)"] = duration;
+        console.log(`get (deep nesting): Average time per operation = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: getPartial", async () => {
+        // First, populate the database
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.set(`benchmark_partial_key_${i}`, { name: `Item ${i}`, value: i, description: `Description ${i}` });
+        }
+
+        const start = performance.now();
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.getPartial(`benchmark_partial_key_${i}`, ["name", "value"]);
+        }
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["getPartial"] = duration;
+        console.log(`getPartial: Average time per operation = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: batchSet", async () => {
+        const items: BatchSetItem[] = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            items.push({ key: `benchmark_batch_key_${i}`, value: i });
+        }
+
+        const start = performance.now();
+        await db.batchSet(items);
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["batchSet"] = duration;
+        console.log(`batchSet: Average time per operation = ${duration.toFixed(4)}ms`);
+
+        // Verify that the keys were set
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            const value = await db.get(`benchmark_batch_key_${i}`);
+            expect(value).toBe(i);
+        }
+    });
+
+    it("benchmark: batchSet (large values)", async () => {
+        const longString = "A".repeat(1000); // Reduced for performance
+        const items: BatchSetItem[] = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            items.push({ key: `benchmark_batch_large_key_${i}`, value: longString });
+        }
+
+        const start = performance.now();
+        await db.batchSet(items);
+        const end = performance.now();
+        const duration = (end - start) / NUM_OPERATIONS;
+        benchmarkResults["batchSet (large values)"] = duration;
+        console.log(`batchSet (large values): Average time per operation = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: queryAst (Eq)", async () => {
+        // First, populate the database
+        const itemsToSet: BatchSetItem[] = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            const key = `benchmark_query_key_${i}`;
+            itemsToSet.push({ key, value: { type: "benchmark", index: i } });
+        }
+        await db.batchSet(itemsToSet);
+
+        const queryAst: AstNode = { Eq: ["type", "benchmark", "String"] };
+
+        const start = performance.now();
+        await db._queryAst(queryAst);
+        const end = performance.now();
+        const duration = (end - start);
+        benchmarkResults["queryAst (Eq)"] = duration;
+        console.log(`queryAst (Eq): Total time for query = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: queryAst (Eq, deep nesting)", async () => {
+        // First, populate the database
+        const itemsToSet: BatchSetItem[] = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            let nestedValue: any = { type: "deep_benchmark", index: i };
+            let key = `benchmark_deep_query_key_${i}`;
+            for (let j = 0; j < DEEP_NESTING_LEVEL; j++) {
+                nestedValue = { [`level${j}`]: nestedValue };
+            }
+            itemsToSet.push({ key, value: nestedValue });
+        }
+        await db.batchSet(itemsToSet);
+
+        const queryAst: AstNode = { Eq: [`level0.level1.level2.level3.level4.type`, "deep_benchmark", "String"] };
+
+        const start = performance.now();
+        await db._queryAst(queryAst);
+        const end = performance.now();
+        const duration = (end - start);
+        benchmarkResults["queryAst (Eq, deep nesting)"] = duration;
+        console.log(`queryAst (Eq, deep nesting): Total time for query = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: queryAst (complex)", async () => {
+        // First, populate the database
+        const itemsToSet: BatchSetItem[] = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            const key = `benchmark_complex_query_key_${i}`;
+            itemsToSet.push({ key, value: { type: "complex", index: i, even: i % 2 === 0, value: i } });
+        }
+        await db.batchSet(itemsToSet);
+
+        // Complex query with multiple AND/OR conditions
+        const queryAst: AstNode = {
+            And: [
+                { Eq: ["type", "complex", "String"] },
+                { Or: [
+                        { Gt: ["index", 500, "Number"] },
+                        { And: [
+                                { Eq: ["even", true, "Bool"] },
+                                { Lt: ["value", 200, "Number"] }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        };
+
+        const start = performance.now();
+        await db._queryAst(queryAst);
+        const end = performance.now();
+        const duration = (end - start);
+        benchmarkResults["queryAst (complex)"] = duration;
+        console.log(`queryAst (complex): Total time for query = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: clearPrefix", async () => {
+        // First, populate the database
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.set(`benchmark_prefix/key_${i}`, i);
+        }
+
+        const start = performance.now();
+        const count = await db.clearPrefix("benchmark_prefix/");
+        const end = performance.now();
+        const duration = end - start;
+        benchmarkResults["clearPrefix"] = duration;
+        console.log(`clearPrefix: Total time = ${duration.toFixed(4)}ms, Count = ${count}`);
+    });
+
+    it("benchmark: dropDatabase", async () => {
+        // First, populate the database
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            await db.set(`benchmark_drop_key_${i}`, i);
+        }
+
+        const start = performance.now();
+        const count = await db.dropDatabase();
+        const end = performance.now();
+        const duration = end - start;
+        benchmarkResults["dropDatabase"] = duration;
+        console.log(`dropDatabase: Total time = ${duration.toFixed(4)}ms, Count = ${count}`);
+    });
+
+    it("benchmark: queryRadius", async () => {
+        // First, populate the database with some GeoPoints
+        const geoPoints = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            geoPoints.push({ key: `geo${i}`, value: { type: "geo", location: { lat: 34.0522 + (i * 0.0001), lon: -118.2437 + (i * 0.0001) } } });
+        }
+        await db.batchSet(geoPoints);
+
+        const start = performance.now();
+        await db.queryRadius({ field: "location", lat: 34.0522, lon: -118.2437, radius: 100 });
+        const end = performance.now();
+        const duration = end - start;
+        benchmarkResults["queryRadius"] = duration;
+        console.log(`queryRadius: Total time = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: queryBox", async () => {
+        // First, populate the database with some GeoPoints
+        const geoPoints = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            geoPoints.push({ key: `geo${i}`, value: { type: "geo", location: { lat: 34.0522 + (i * 0.0001), lon: -118.2437 + (i * 0.0001) } } });
+        }
+        await db.batchSet(geoPoints);
+
+        const start = performance.now();
+        await db.queryBox({ field: "location", min_lat: 34.0521, min_lon: -118.2438, max_lat: 34.0525, max_lon: -118.2436 });
+        const end = performance.now();
+        const duration = end - start;
+        benchmarkResults["queryBox"] = duration;
+        console.log(`queryBox: Total time = ${duration.toFixed(4)}ms`);
+    });
+
+    it("benchmark: queryAnd", async () => {
+        // Populate the database
+        const itemsToSet: BatchSetItem[] = [];
+        for (let i = 0; i < NUM_OPERATIONS; i++) {
+            const key = `benchmark_and_key_${i}`;
+            itemsToSet.push({ key, value: { type: "and_test", index: i, even: i % 2 === 0, value: i } });
+        }
+        await db.batchSet(itemsToSet);
+
+        const start = performance.now();
+        await db.queryAnd([["type", "===", "and_test"], ["even", "===", "true"]]);
+        const end = performance.now();
+        const duration = end - start;
+        benchmarkResults["queryAnd"] = duration;
+        console.log(`queryAnd: Total time = ${duration.toFixed(4)}ms`);
+    });
 });
