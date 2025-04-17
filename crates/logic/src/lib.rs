@@ -1,20 +1,23 @@
 use serde::{Serialize, Deserialize, de::Error as SerdeError};
-use serde_json::{Value, json}; // Removed Map
-use sled::{Db, transaction::{TransactionError, UnabortableTransactionError, ConflictableTransactionError}};
+use serde_json::{Value, json, Map};
+use sled::{Db, IVec, Batch, transaction::{TransactionError, UnabortableTransactionError, ConflictableTransactionError, TransactionalTree}};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::{error, debug, warn};
-use geo::{Coord, Point, Rect, prelude::*}; // Prelude includes HaversineDistance trait
-// Removed: use geo::prelude::Distance;
-use geohash::encode;
-use std::convert::TryInto; // Removed Infallible
+use geo::{Coord, Point, Rect, prelude::*};
+use geohash::{encode, neighbors as geohash_neighbors, Neighbors}; // Removed decode_bbox
+use std::convert::TryInto;
 use std::cmp::Ordering;
 use hex;
 use lazy_static::lazy_static;
 use regex::Regex;
+// Removed TypeId
+use std::ops::Bound;
+use std::hash::{Hash, Hasher};
+// Removed Arc
+// Removed FromIterator
 
-// Constants
-pub const GEO_INDEX_PREFIX: &str = "__geo__";
+pub const GEO_SORTED_INDEX_PREFIX: &str = "__geo_sorted__";
 pub const GEOHASH_PRECISION: usize = 9;
 pub const CAS_RETRY_LIMIT: u32 = 10;
 pub const DEFAULT_DB_PATH: &str = "database_data_server";
@@ -22,7 +25,6 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:3000";
 pub const FIELD_INDEX_PREFIX: &str = "__field_index__";
 pub const FIELD_SORTED_INDEX_PREFIX: &str = "__field_sorted__";
 
-// Error Handling
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Sled database error: {0}")]
@@ -51,6 +53,20 @@ pub enum DbError {
     Io(#[from] std::io::Error),
     #[error("Invalid value for comparison: {0}")]
     InvalidComparisonValue(String),
+    #[error("Value is not an object, cannot retrieve partial fields")]
+    NotAnObject,
+    #[error("Field not found in object: {0}")]
+    FieldNotFound(String),
+    #[error("Field is not a valid GeoPoint: {0}")]
+    NotAGeoPoint(String),
+    #[error("Invalid Geo Sorted Index Key format: {0}")]
+    InvalidGeoSortedKey(String),
+    #[error("AST Query Error: {0}")]
+    AstQueryError(String),
+    #[error("Invalid path for projection or nested query: {0}")]
+    InvalidPath(String),
+    #[error("Transaction operation failed: {0}")]
+    TransactionOperationFailed(String),
 }
 
 impl From<TransactionError<DbError>> for DbError {
@@ -73,7 +89,13 @@ impl From<UnabortableTransactionError> for DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
-// GeoPoint Definition
+#[derive(Debug, Clone, Default)]
+pub struct DbConfig {
+    pub hash_indexed_fields: HashSet<String>,
+    pub sorted_indexed_fields: HashSet<String>,
+    pub geo_indexed_fields: HashSet<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GeoPoint {
     pub lat: f64,
@@ -88,41 +110,29 @@ impl From<GeoPoint> for Coord<f64> {
     fn from(gp: GeoPoint) -> Self { Coord { x: gp.lon, y: gp.lat } }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct GeoEntry {
-    key: String,
-    geohash: String,
-    point: GeoPoint,
+fn get_geo_sorted_index_key(field_path: &str, geohash: &str, key: &str) -> String {
+    format!("{}{}:{}:{}", GEO_SORTED_INDEX_PREFIX, field_path, geohash, key)
 }
 
-struct DebuggableFilter(Box<dyn Fn(&Value) -> bool + Send + Sync + 'static>);
-
-impl DebuggableFilter {
-    fn new(filter: Box<dyn Fn(&Value) -> bool + Send + Sync + 'static>) -> Self {
-        DebuggableFilter(filter)
-    }
+fn get_geo_sorted_index_prefix_for_hash(field_path: &str, geohash: &str) -> String {
+    format!("{}{}:{}:", GEO_SORTED_INDEX_PREFIX, field_path, geohash)
 }
 
-impl std::fmt::Debug for DebuggableFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Filter")
-    }
+fn get_geo_sorted_index_prefix_for_field(field_path: &str) -> String {
+    format!("{}{}:", GEO_SORTED_INDEX_PREFIX, field_path)
 }
 
-fn get_geo_index_key(field: &str, geohash: &str) -> String {
-    format!("{}{}:{}", GEO_INDEX_PREFIX, field, geohash)
+
+fn get_field_index_key(field_path: &str, value: &str) -> String {
+    format!("{}{}:{}", FIELD_INDEX_PREFIX, field_path, value)
 }
 
-fn get_field_index_key(field: &str, value: &str) -> String {
-    format!("{}{}:{}", FIELD_INDEX_PREFIX, field, value)
+fn get_field_sorted_index_key(field_path: &str, encoded_value: &[u8], key: &str) -> String {
+    format!("{}{}:{}:{}", FIELD_SORTED_INDEX_PREFIX, field_path, hex::encode(encoded_value), key)
 }
 
-fn get_field_sorted_index_key(field: &str, encoded_value: &[u8], key: &str) -> String {
-    format!("{}{}:{}:{}", FIELD_SORTED_INDEX_PREFIX, field, hex::encode(encoded_value), key)
-}
-
-fn get_field_sorted_index_prefix(field: &str) -> String {
-    format!("{}{}:", FIELD_SORTED_INDEX_PREFIX, field)
+fn get_field_sorted_index_prefix(field_path: &str) -> String {
+    format!("{}{}:", FIELD_SORTED_INDEX_PREFIX, field_path)
 }
 
 fn encode_sorted_value(value: &Value) -> DbResult<Vec<u8>> {
@@ -130,25 +140,24 @@ fn encode_sorted_value(value: &Value) -> DbResult<Vec<u8>> {
     match value {
         Value::Number(num) => {
             if let Some(i) = num.as_i64() {
-                buf.push(0x01); // Type byte for i64
+                buf.push(0x01);
                 buf.extend_from_slice(&i.to_be_bytes());
             } else if let Some(u) = num.as_u64() {
-                // Note: u64 comparison might behave unexpectedly with i64/f64 in compare_values
-                buf.push(0x02); // Type byte for u64
+                buf.push(0x02);
                 buf.extend_from_slice(&u.to_be_bytes());
             } else if let Some(f) = num.as_f64() {
-                buf.push(0x03); // Type byte for f64
+                buf.push(0x03);
                 buf.extend_from_slice(&f.to_be_bytes());
             } else {
                 return Err(DbError::Serde(serde_json::Error::custom("Unsupported number type")));
             }
         }
         Value::String(s) => {
-            buf.push(0x04); // Type byte for string
+            buf.push(0x04);
             buf.extend_from_slice(s.as_bytes());
         }
         Value::Bool(b) => {
-            buf.push(0x05); // Type byte for bool
+            buf.push(0x05);
             buf.push(if *b { 1 } else { 0 });
         }
         _ => return Err(DbError::Serde(serde_json::Error::custom("Unsupported type for sorted index"))),
@@ -161,26 +170,26 @@ fn decode_sorted_value(encoded: &[u8]) -> DbResult<Value> {
         return Err(DbError::Serde(serde_json::Error::custom("Empty encoded value")));
     }
     match encoded[0] {
-        0x01 => { // i64
+        0x01 => {
             if encoded.len() < 9 { return Err(DbError::Serde(serde_json::Error::custom("Invalid i64 encoding length"))); }
             let num = i64::from_be_bytes(encoded[1..9].try_into()?);
             Ok(Value::Number(num.into()))
         }
-        0x02 => { // u64
+        0x02 => {
             if encoded.len() < 9 { return Err(DbError::Serde(serde_json::Error::custom("Invalid u64 encoding length"))); }
             let num = u64::from_be_bytes(encoded[1..9].try_into()?);
             Ok(Value::Number(num.into()))
         }
-        0x03 => { // f64
+        0x03 => {
             if encoded.len() < 9 { return Err(DbError::Serde(serde_json::Error::custom("Invalid f64 encoding length"))); }
             let num = f64::from_be_bytes(encoded[1..9].try_into()?);
             Ok(Value::Number(serde_json::Number::from_f64(num).ok_or_else(|| DbError::Serde(serde_json::Error::custom("Invalid f64")))?) )
         }
-        0x04 => { // String
+        0x04 => {
             let s = String::from_utf8(encoded[1..].to_vec())?;
             Ok(Value::String(s))
         }
-        0x05 => { // Bool
+        0x05 => {
             if encoded.len() < 2 { return Err(DbError::Serde(serde_json::Error::custom("Invalid bool encoding length"))); }
             Ok(Value::Bool(encoded[1] != 0))
         }
@@ -198,7 +207,6 @@ fn parse_value(value_str: &str) -> DbResult<Value> {
     } else if value_str == "false" {
         Ok(Value::Bool(false))
     } else if NUM_RE.is_match(value_str) {
-        // Try parsing as i64 first, then f64
         if let Ok(i) = value_str.parse::<i64>() {
             Ok(Value::Number(i.into()))
         } else if let Ok(f) = value_str.parse::<f64>() {
@@ -207,109 +215,249 @@ fn parse_value(value_str: &str) -> DbResult<Value> {
             Err(DbError::InvalidComparisonValue(format!("Could not parse number: {}", value_str)))
         }
     } else {
-        // Treat as a plain string if not boolean or number
-        // Remove surrounding quotes if present (common from JSON stringification)
         Ok(Value::String(value_str.trim_matches('"').to_string()))
     }
 }
 
-// Helper function to compare serde_json::Value (replaces impl PartialOrd)
 fn compare_values(v1: &Value, v2: &Value) -> Option<Ordering> {
     match (v1, v2) {
         (Value::Number(n1), Value::Number(n2)) => {
-            // Prioritize f64 comparison for broader compatibility
             if let (Some(f1), Some(f2)) = (n1.as_f64(), n2.as_f64()) {
                 f1.partial_cmp(&f2)
             } else {
-                // Fallback or more specific integer comparison could be added here if needed
                 None
             }
         }
         (Value::String(s1), Value::String(s2)) => s1.partial_cmp(s2),
         (Value::Bool(b1), Value::Bool(b2)) => b1.partial_cmp(b2),
-        // Add other type comparisons if needed, otherwise return None
-        // Comparing different types is generally not meaningful -> None
-        _ => None,
+        (Value::Null, Value::Null) => Some(Ordering::Equal),
+        _ => {
+            if std::mem::discriminant(v1) != std::mem::discriminant(v2) {
+                 None
+            } else {
+                 None
+            }
+        }
     }
 }
 
+fn index_value_recursive(
+    tx_db: &TransactionalTree,
+    key: &str,
+    current_path: &str,
+    value: &Value,
+    config: &DbConfig,
+    batch: &mut Batch,
+) -> DbResult<()> {
+    match value {
+        Value::Object(map) => {
+            for (field_name, field_value) in map {
+                let new_path = if current_path.is_empty() {
+                    field_name.clone()
+                } else {
+                    format!("{}.{}", current_path, field_name)
+                };
 
-// Core CRUD Operations
-pub fn set_key(db: &Db, key: &str, value: Value) -> DbResult<()> {
-    let serialized_value = serde_json::to_vec(&value)?;
-    let key_bytes = key.as_bytes();
-
-    db.transaction(|tx_db| {
-        // --- Remove old indexes ---
-        if let Some(old_ivec) = tx_db.get(key_bytes)? {
-            if let Ok(old_val) = serde_json::from_slice::<Value>(&old_ivec) {
-                if let Value::Object(map) = &old_val {
-                    for (field_name, field_value) in map {
-                        // Remove hash index entries
-                        match field_value {
-                            Value::Array(arr) => {
-                                for elem in arr {
-                                    let elem_str = elem.to_string().trim_matches('"').to_string(); // Handle potential quotes
-                                    let index_key = get_field_index_key(field_name, &elem_str);
-                                    tx_db.remove(index_key.as_bytes())?;
-                                }
-                            }
-                            _ => {
-                                let index_key = get_field_index_key(field_name, &field_value.to_string().trim_matches('"'));
-                                tx_db.remove(index_key.as_bytes())?;
-                            }
-                        }
-
-                        // Remove sorted index entry
-                        if let Ok(encoded) = encode_sorted_value(field_value) {
-                            let sorted_index_key = get_field_sorted_index_key(field_name, &encoded, key);
-                            tx_db.remove(sorted_index_key.as_bytes())?;
-                        }
-
-                        // Remove geo index entry
-                        if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(field_value.clone()) {
-                             if let Err(e) = remove_geospatial_index(tx_db, key, field_name, &geo_point).map_err(ConflictableTransactionError::Abort) {
-                                 return Err(e);
-                             }
-                         }
+                if config.geo_indexed_fields.contains(&new_path) {
+                    if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(field_value.clone()) {
+                        index_geospatial_field(tx_db, key, &new_path, &geo_point)?;
+                    } else if !field_value.is_null() {
+                         warn!(key=key, path=%new_path, "Field configured for geo indexing is not a valid GeoPoint or null");
                     }
+                }
+
+                index_value_recursive(tx_db, key, &new_path, field_value, config, batch)?;
+            }
+        }
+        Value::Array(arr) => {
+            for (index, elem) in arr.iter().enumerate() {
+                let index_path = format!("{}.{}", current_path, index); // Path to the element itself
+                index_value_recursive(tx_db, key, &index_path, elem, config, batch)?;
+
+                // Index primitive values within the array against the array's path
+                if config.hash_indexed_fields.contains(current_path) {
+                     if !elem.is_object() && !elem.is_array() { // Only index primitives directly
+                         let elem_str = elem.to_string().trim_matches('"').to_string();
+                         let index_key = get_field_index_key(current_path, &elem_str);
+                         batch.insert(index_key.as_bytes(), key.as_bytes());
+                     }
+                }
+                 // Index sortable primitive values within the array against the array's path
+                 if config.sorted_indexed_fields.contains(current_path) {
+                     if let Ok(encoded) = encode_sorted_value(elem) {
+                         let sorted_index_key = get_field_sorted_index_key(current_path, &encoded, key);
+                         batch.insert(sorted_index_key.as_bytes(), vec![]);
+                     }
+                 }
+            }
+        }
+        _ => { // Primitive value
+            if config.hash_indexed_fields.contains(current_path) {
+                let value_str = value.to_string().trim_matches('"').to_string();
+                let index_key = get_field_index_key(current_path, &value_str);
+                batch.insert(index_key.as_bytes(), key.as_bytes());
+            }
+            if config.sorted_indexed_fields.contains(current_path) {
+                if let Ok(encoded) = encode_sorted_value(value) {
+                    let sorted_index_key = get_field_sorted_index_key(current_path, &encoded, key);
+                    batch.insert(sorted_index_key.as_bytes(), vec![]);
                 }
             }
         }
+    }
+    Ok(())
+}
 
-        // --- Insert new value ---
-        tx_db.insert(key_bytes, serialized_value.clone())?;
-
-        // --- Create new indexes ---
-        if let Value::Object(map) = &value {
+fn remove_indices_recursive(
+    tx_db: &TransactionalTree,
+    key: &str,
+    current_path: &str,
+    value: &Value,
+    config: &DbConfig,
+    batch: &mut Batch,
+) -> DbResult<()> {
+     match value {
+        Value::Object(map) => {
             for (field_name, field_value) in map {
-                // Create hash index entries
-                match field_value {
-                    Value::Array(arr) => {
-                        for elem in arr {
-                            let elem_str = elem.to_string().trim_matches('"').to_string(); // Handle potential quotes
-                            let index_key = get_field_index_key(field_name, &elem_str);
-                            tx_db.insert(index_key.as_bytes(), key_bytes.to_vec())?;
-                        }
-                    }
-                    _ => {
-                        let index_key = get_field_index_key(field_name, &field_value.to_string().trim_matches('"'));
-                        tx_db.insert(index_key.as_bytes(), key_bytes.to_vec())?;
+                let new_path = if current_path.is_empty() {
+                    field_name.clone()
+                } else {
+                    format!("{}.{}", current_path, field_name)
+                };
+
+                if config.geo_indexed_fields.contains(&new_path) {
+                    if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(field_value.clone()) {
+                         remove_geospatial_index(tx_db, key, &new_path, &geo_point)?;
                     }
                 }
 
-                // Create sorted index entry
-                if let Ok(encoded) = encode_sorted_value(field_value) {
-                    let sorted_index_key = get_field_sorted_index_key(field_name, &encoded, key);
-                    tx_db.insert(sorted_index_key.as_bytes(), vec![])?; // Store empty value for sorted index
-                }
+                remove_indices_recursive(tx_db, key, &new_path, field_value, config, batch)?;
+            }
+        }
+        Value::Array(arr) => {
+            for (index, elem) in arr.iter().enumerate() {
+                let index_path = format!("{}.{}", current_path, index);
+                remove_indices_recursive(tx_db, key, &index_path, elem, config, batch)?;
 
-                // Create geo index entry
-                if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(field_value.clone()) {
-                     if let Err(e) = index_geospatial_field(tx_db, key, field_name, &geo_point).map_err(ConflictableTransactionError::Abort) {
-                         return Err(e);
+                 if config.hash_indexed_fields.contains(current_path) {
+                     if !elem.is_object() && !elem.is_array() {
+                         let elem_str = elem.to_string().trim_matches('"').to_string();
+                         let index_key = get_field_index_key(current_path, &elem_str);
+                         batch.remove(index_key.as_bytes());
                      }
                  }
+                 if config.sorted_indexed_fields.contains(current_path) {
+                     if let Ok(encoded) = encode_sorted_value(elem) {
+                         let sorted_index_key = get_field_sorted_index_key(current_path, &encoded, key);
+                         batch.remove(sorted_index_key.as_bytes());
+                     }
+                 }
+            }
+        }
+        _ => { // Primitive value
+            if config.hash_indexed_fields.contains(current_path) {
+                let value_str = value.to_string().trim_matches('"').to_string();
+                let index_key = get_field_index_key(current_path, &value_str);
+                batch.remove(index_key.as_bytes());
+            }
+            if config.sorted_indexed_fields.contains(current_path) {
+                if let Ok(encoded) = encode_sorted_value(value) {
+                    let sorted_index_key = get_field_sorted_index_key(current_path, &encoded, key);
+                    batch.remove(sorted_index_key.as_bytes());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+
+fn set_key_internal(tx_db: &TransactionalTree, key: &str, value: &Value, config: &DbConfig) -> DbResult<()> { // Take value by reference
+    let serialized_value = serde_json::to_vec(value)?;
+    let key_bytes = key.as_bytes();
+    let mut removal_batch = Batch::default();
+    let mut creation_batch = Batch::default();
+
+    if let Some(old_ivec) = tx_db.get(key_bytes)? {
+        if let Ok(old_val) = serde_json::from_slice::<Value>(&old_ivec) {
+             remove_indices_recursive(tx_db, key, "", &old_val, config, &mut removal_batch)?;
+        }
+    }
+
+    tx_db.apply_batch(&removal_batch)?;
+    tx_db.insert(key_bytes, serialized_value.clone())?;
+    index_value_recursive(tx_db, key, "", value, config, &mut creation_batch)?; // Pass reference
+    tx_db.apply_batch(&creation_batch)?;
+    Ok(())
+}
+
+pub fn set_key(db: &Db, key: &str, value: Value, config: &DbConfig) -> DbResult<()> {
+    db.transaction(|tx_db| {
+        // Clone value here as it's moved into the closure
+        set_key_internal(tx_db, key, &value, config).map_err(ConflictableTransactionError::Abort)
+    })?;
+    Ok(())
+}
+
+#[derive(Deserialize, Debug)]
+pub struct BatchSetItem {
+    key: String,
+    value: Value,
+}
+
+pub fn batch_set(db: &Db, items: &[BatchSetItem], config: &DbConfig) -> DbResult<()> { // Take slice
+     db.transaction(|tx_db| {
+         for item in items { // Iterate over slice
+             set_key_internal(tx_db, &item.key, &item.value, config) // Pass references
+                 .map_err(|e| ConflictableTransactionError::Abort(DbError::TransactionOperationFailed(format!("Batch set failed for key '{}': {}", item.key, e))))?;
+         }
+         Ok(())
+     })?;
+     Ok(())
+}
+
+fn delete_key_internal(tx_db: &TransactionalTree, key: &str, config: &DbConfig) -> DbResult<()> {
+    let key_bytes = key.as_bytes();
+    if let Some(ivec) = tx_db.get(key_bytes)? {
+        let mut removal_batch = Batch::default();
+        if let Ok(val) = serde_json::from_slice::<Value>(&ivec) {
+             remove_indices_recursive(tx_db, key, "", &val, config, &mut removal_batch)?;
+        }
+        removal_batch.remove(key_bytes);
+        tx_db.apply_batch(&removal_batch)?;
+    }
+    Ok(())
+}
+
+pub async fn delete_key(db: &Db, key: &str, config: &DbConfig) -> DbResult<()> {
+    db.transaction(|tx_db| {
+        delete_key_internal(tx_db, key, config).map_err(ConflictableTransactionError::Abort)
+    })?;
+    db.flush_async().await?;
+    Ok(())
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum TransactionOperation {
+    #[serde(rename = "set")]
+    Set { key: String, value: Value },
+    #[serde(rename = "delete")]
+    Delete { key: String },
+}
+
+pub fn execute_transaction(db: &Db, operations: &[TransactionOperation], config: &DbConfig) -> DbResult<()> { // Take slice
+    db.transaction(|tx_db| {
+        for op in operations { // Iterate over slice
+            match op {
+                TransactionOperation::Set { key, value } => {
+                    set_key_internal(tx_db, key, value, config) // Pass references
+                        .map_err(|e| ConflictableTransactionError::Abort(DbError::TransactionOperationFailed(format!("Set failed for key '{}': {}", key, e))))?;
+                }
+                TransactionOperation::Delete { key } => {
+                    delete_key_internal(tx_db, key, config)
+                         .map_err(|e| ConflictableTransactionError::Abort(DbError::TransactionOperationFailed(format!("Delete failed for key '{}': {}", key, e))))?;
+                }
             }
         }
         Ok(())
@@ -328,66 +476,152 @@ pub fn get_key(db: &Db, key: &str) -> DbResult<Value> {
     }
 }
 
-pub async fn delete_key(db: &Db, key: &str) -> DbResult<()> {
-    let key_bytes = key.as_bytes();
-    if let Some(ivec) = db.get(key_bytes)? {
-        db.transaction(|tx_db| {
-            if let Ok(val) = serde_json::from_slice::<Value>(&ivec) {
-                if let Value::Object(map) = &val {
-                    for (field_name, field_value) in map {
-                        // Remove hash index entries
-                        match field_value {
-                            Value::Array(arr) => {
-                                for elem in arr {
-                                    let elem_str = elem.to_string().trim_matches('"').to_string();
-                                    let index_key = get_field_index_key(field_name, &elem_str);
-                                    tx_db.remove(index_key.as_bytes())?;
-                                }
-                            }
-                            _ => {
-                                let index_key = get_field_index_key(field_name, &field_value.to_string().trim_matches('"'));
-                                tx_db.remove(index_key.as_bytes())?;
-                            }
-                        }
-
-                        // Remove sorted index entry
-                        if let Ok(encoded) = encode_sorted_value(field_value) {
-                            let sorted_index_key = get_field_sorted_index_key(field_name, &encoded, key);
-                            tx_db.remove(sorted_index_key.as_bytes())?;
-                        }
-
-                        // Remove geo index entry
-                        if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(field_value.clone()) {
-                            if let Err(e) = remove_geospatial_index(tx_db, key, field_name, &geo_point).map_err(|e| ConflictableTransactionError::Abort(e)) {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
+fn get_value_by_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for part in path.split('.') {
+        if let Some(obj) = current.as_object() {
+            current = obj.get(part)?;
+        } else if let Some(arr) = current.as_array() {
+            if let Ok(index) = part.parse::<usize>() {
+                current = arr.get(index)?;
+            } else {
+                return None;
             }
-            // Remove the main key entry
-            tx_db.remove(key_bytes)?;
-            Ok(())
-        })?;
-        db.flush_async().await?;
-    } else {
-         // Key doesn't exist, nothing to delete
-         return Ok(());
+        } else {
+            return None;
+        }
     }
-    Ok(())
+    Some(current)
+}
+
+fn insert_value_by_path(target: &mut Value, path_parts: &[&str], value_to_insert: Value) -> DbResult<()> {
+    if path_parts.is_empty() {
+        return Err(DbError::InvalidPath("Empty path for insertion".to_string()));
+    }
+
+    let key = path_parts[0];
+
+    if path_parts.len() == 1 {
+        if let Some(obj) = target.as_object_mut() {
+            obj.insert(key.to_string(), value_to_insert);
+            Ok(())
+        } else if let Some(arr) = target.as_array_mut() {
+             if let Ok(index) = key.parse::<usize>() {
+                 if index == arr.len() {
+                     arr.push(value_to_insert);
+                 } else if index < arr.len() {
+                     arr[index] = value_to_insert;
+                 } else {
+                     return Err(DbError::InvalidPath(format!("Index {} out of bounds for array in path", index)));
+                 }
+                 Ok(())
+             } else {
+                 Err(DbError::InvalidPath(format!("Cannot insert object key '{}' into array", key)))
+             }
+        } else {
+            Err(DbError::InvalidPath(format!("Cannot insert into non-container type at path step '{}'", key)))
+        }
+    } else {
+        let next_target = if let Some(obj) = target.as_object_mut() {
+            obj.entry(key.to_string())
+               .or_insert_with(|| {
+                   if path_parts.get(1).map_or(false, |p| p.parse::<usize>().is_ok()) {
+                       Value::Array(vec![])
+                   } else {
+                       Value::Object(Map::new())
+                   }
+               })
+        } else if let Some(arr) = target.as_array_mut() {
+             if let Ok(index) = key.parse::<usize>() {
+                 if index < arr.len() {
+                     &mut arr[index]
+                 } else if index == arr.len() {
+                      let new_val = if path_parts.get(1).map_or(false, |p| p.parse::<usize>().is_ok()) {
+                           Value::Array(vec![])
+                       } else {
+                           Value::Object(Map::new())
+                       };
+                      arr.push(new_val);
+                      arr.last_mut().unwrap()
+                 } else {
+                      return Err(DbError::InvalidPath(format!("Index {} out of bounds for array creation in path", index)));
+                 }
+             } else {
+                  return Err(DbError::InvalidPath(format!("Cannot access object key '{}' in array", key)));
+             }
+        } else {
+             return Err(DbError::InvalidPath(format!("Cannot traverse non-container type at path step '{}'", key)));
+        };
+
+        insert_value_by_path(next_target, &path_parts[1..], value_to_insert)
+    }
 }
 
 
-// Query AND Conditions
+fn apply_projection(documents: Vec<Value>, projection: &Vec<String>) -> DbResult<Vec<Value>> {
+    if projection.is_empty() {
+        return Ok(documents);
+    }
+
+    let mut projected_results = Vec::new();
+    for doc in documents {
+        let mut projected_doc = Value::Object(Map::new());
+        for path in projection {
+             if let Some(value) = get_value_by_path(&doc, path) {
+                 let parts: Vec<&str> = path.split('.').collect();
+                 insert_value_by_path(&mut projected_doc, &parts, value.clone())?;
+             } else {
+                  let parts: Vec<&str> = path.split('.').collect();
+                  if parts.len() > 1 {
+                      let parent_path = parts[..parts.len()-1].join(".");
+                      let last_part = parts.last().unwrap();
+                      if let Some(Value::Array(arr)) = get_value_by_path(&doc, &parent_path) {
+                          let projected_array_values: Vec<Value> = arr.iter()
+                              .filter_map(|elem| elem.get(*last_part).cloned())
+                              .collect();
+                          if !projected_array_values.is_empty() {
+                               // Projecting array elements needs careful path handling in insert_value_by_path
+                               // For now, let's insert the array at the parent path
+                               let parent_parts: Vec<&str> = parent_path.split('.').collect();
+                               insert_value_by_path(&mut projected_doc, &parent_parts, Value::Array(projected_array_values))?;
+                          }
+                      } else {
+                           warn!("Projection path '{}' not found in document (array check)", path);
+                      }
+                  } else {
+                       warn!("Projection path '{}' not found in document", path);
+                  }
+             }
+        }
+         if projected_doc.as_object().map_or(false, |m| !m.is_empty()) || doc.as_object().map_or(false, |m| m.is_empty()) {
+             projected_results.push(projected_doc);
+         } else if !doc.is_object() && !doc.is_null() {
+              warn!("Projection applied to non-object document, skipping result.");
+         } else {
+              projected_results.push(Value::Object(Map::new()));
+         }
+    }
+    Ok(projected_results)
+}
+
+
+pub fn get_partial_key(db: &Db, key: &str, fields: &[String]) -> DbResult<Value> {
+    let full_value = get_key(db, key)?;
+    let projection_paths: Vec<String> = fields.iter().cloned().collect();
+    let projected_docs = apply_projection(vec![full_value], &projection_paths)?;
+    projected_docs.into_iter().next().ok_or(DbError::NotFound)
+}
+
+
 pub fn query_and(db: &Db, conditions: Vec<(&str, &str, &str)>) -> DbResult<Vec<Value>> {
+
     let mut key_sets: Vec<HashSet<String>> = Vec::new();
 
     for (field, operator, value_str) in &conditions {
         let mut current_keys = HashSet::new();
         match *operator {
             "===" | "includes" => {
-                // Use hash index for exact match and includes (now works for array elements)
-                let value_parsed = parse_value(value_str)?; // Parse to handle quotes correctly if needed
+                let value_parsed = parse_value(value_str)?;
                 let index_key = get_field_index_key(field, &value_parsed.to_string().trim_matches('"'));
                 current_keys = db.scan_prefix(index_key.as_bytes())
                     .filter_map(|res| res.ok())
@@ -395,52 +629,16 @@ pub fn query_and(db: &Db, conditions: Vec<(&str, &str, &str)>) -> DbResult<Vec<V
                     .collect::<HashSet<_>>();
             }
             ">" | "<" | ">=" | "<=" | "!=" => {
-                // Use sorted index for range and inequality queries
-                let value = parse_value(value_str)?; // Parse the query value string
-                let prefix = get_field_sorted_index_prefix(field);
+                let value = parse_value(value_str)?;
 
-                for item_result in db.scan_prefix(prefix.as_bytes()) {
-                    let (k, _) = item_result?;
-                    let key_str = String::from_utf8_lossy(&k);
-                    // Expected format: __field_sorted__{field}:{hex_encoded_value}:{primary_key}
-                    let parts: Vec<&str> = key_str.splitn(4, ':').collect(); // Split by ':'
-                    if parts.len() < 4 { continue; } // Need prefix, field, encoded_val, primary_key
-
-                    let stored_encoded_hex = parts[2];
-                    let primary_key = parts[3];
-
-                    if let Ok(stored_encoded) = hex::decode(stored_encoded_hex) {
-                         if let Ok(stored_value) = decode_sorted_value(&stored_encoded) {
-                             // Use the compare_values helper function
-                             let comparison_result = compare_values(&stored_value, &value);
-
-                             // Check if the comparison matches the operator
-                             let matches = match *operator { // Match on the operator string directly
-                                 ">" => comparison_result == Some(Ordering::Greater),
-                                 "<" => comparison_result == Some(Ordering::Less),
-                                 ">=" => comparison_result == Some(Ordering::Greater) || comparison_result == Some(Ordering::Equal),
-                                 "<=" => comparison_result == Some(Ordering::Less) || comparison_result == Some(Ordering::Equal),
-                                 "!=" => comparison_result != Some(Ordering::Equal),
-                                 _ => false, // Should not happen based on outer match
-                             };
-
-                             if matches {
-                                 current_keys.insert(primary_key.to_string());
-                             }
-                         } else {
-                              warn!("Failed to decode sorted value for key: {}", key_str);
-                         }
-                    } else {
-                         warn!("Failed to decode hex for sorted key: {}", key_str);
-                    }
-                }
+                let keys = fetch_keys_sorted_index(db, field, operator, &value, &DataType::Number)?;
+                current_keys.extend(keys);
             }
             _ => return Err(DbError::MissingData(format!("Unsupported operator: {}", operator))),
         }
         key_sets.push(current_keys);
     }
 
-    // Find intersection of all key sets
     let common_keys = key_sets.into_iter()
         .fold(None::<HashSet<String>>, |acc, set| match acc {
             None => Some(set),
@@ -449,187 +647,303 @@ pub fn query_and(db: &Db, conditions: Vec<(&str, &str, &str)>) -> DbResult<Vec<V
         .unwrap_or_default();
 
 
-    // Fetch corresponding values
     let results: DbResult<Vec<Value>> = common_keys.into_iter()
-        .map(|k| get_key(db, &k)) // Fetch the full value
-        .collect(); // Collect into DbResult<Vec<Value>>
+        .map(|k| get_key(db, &k))
+        .collect();
 
     results
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub enum DataType {
+    String,
+    Number,
+    Bool,
+}
 
-// AST-Based Query Planner
+
 #[derive(Debug, Deserialize)]
 pub enum QueryNode {
-    Eq(String, Value),      // Field, Value
-    Includes(String, Value), // Field, Value
-    Gt(String, Value),       // Field, Value
-    Lt(String, Value),       // Field, Value
-    Gte(String, Value),      // Field, Value
-    Lte(String, Value),      // Field, Value
-    Ne(String, Value),       // Field, Value (Not Equal)
+    Eq(String, Value, DataType),
+    Includes(String, Value, DataType),
+    Gt(String, Value, DataType),
+    Lt(String, Value, DataType),
+    Gte(String, Value, DataType),
+    Lte(String, Value, DataType),
+    Ne(String, Value, DataType),
     And(Box<QueryNode>, Box<QueryNode>),
     Or(Box<QueryNode>, Box<QueryNode>),
     Not(Box<QueryNode>),
-}
-
-#[derive(Debug)]
-pub struct QueryPlan {
-    indexes: Vec<String>, // Can be hash index keys or sorted index prefixes
-    filters: Vec<DebuggableFilter>,
-}
-
-// Need a helper to clone QueryNode for filter closures
-fn clone_query_node_for_filter(node: &QueryNode) -> Option<(String, Value, &'static str)> {
-    match node {
-        QueryNode::Gt(f, v) => Some((f.clone(), v.clone(), ">")),
-        QueryNode::Lt(f, v) => Some((f.clone(), v.clone(), "<")),
-        QueryNode::Gte(f, v) => Some((f.clone(), v.clone(), ">=")),
-        QueryNode::Lte(f, v) => Some((f.clone(), v.clone(), "<=")),
-        QueryNode::Ne(f, v) => Some((f.clone(), v.clone(), "!=")),
-        _ => None,
-    }
+    GeoWithinRadius { field: String, lat: f64, lon: f64, radius: f64 },
+    GeoInBox { field: String, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64 },
 }
 
 
-pub fn build_query_plan(db: &Db, query_node: QueryNode) -> DbResult<QueryPlan> {
-    match query_node {
-        QueryNode::Eq(field, value) => {
-            let index_key = get_field_index_key(&field, &value.to_string().trim_matches('"'));
-            Ok(QueryPlan {
-                indexes: vec![index_key], // Use hash index
-                filters: vec![DebuggableFilter::new(Box::new(move |v| {
-                    v.get(&field).map_or(false, |val| val == &value) // Simple equality check
-                }))],
-            })
-        }
-        QueryNode::Includes(field, value) => {
-             let index_key = get_field_index_key(&field, &value.to_string().trim_matches('"'));
-             Ok(QueryPlan {
-                 indexes: vec![index_key], // Use hash index (points to keys containing the element)
-                 filters: vec![DebuggableFilter::new(Box::new(move |v| {
-                     v.get(&field).map_or(false, |val| { // Post-filter to confirm array contains value
-                         if let Value::Array(arr) = val {
-                             arr.contains(&value)
-                         } else {
-                             false // Field exists but is not an array
-                         }
-                     })
-                 }))],
-             })
-         }
-        QueryNode::Gt(_, _) | QueryNode::Lt(_, _) | QueryNode::Gte(_, _) | QueryNode::Lte(_, _) | QueryNode::Ne(_, _) => {
-            // Clone necessary parts for the closure
-            if let Some((field, value, operator)) = clone_query_node_for_filter(&query_node) {
-                let prefix = get_field_sorted_index_prefix(&field);
-                Ok(QueryPlan {
-                    indexes: vec![prefix], // Use sorted index prefix
-                    filters: vec![DebuggableFilter::new(Box::new(move |v| {
-                        v.get(&field).map_or(false, |val| {
-                            let comparison = compare_values(val, &value); // Use helper
-                            match operator { // Use the captured operator string
-                                ">" => comparison == Some(Ordering::Greater),
-                                "<" => comparison == Some(Ordering::Less),
-                                ">=" => comparison == Some(Ordering::Greater) || comparison == Some(Ordering::Equal),
-                                "<=" => comparison == Some(Ordering::Less) || comparison == Some(Ordering::Equal),
-                                "!=" => comparison != Some(Ordering::Equal),
-                                _ => false,
-                            }
-                        })
-                    }))],
-                })
-            } else {
-                 // Should not happen if called from the outer match arms
-                 Err(DbError::MissingData("Internal error cloning query node".to_string()))
-            }
-        }
-        QueryNode::And(left, right) => {
-            let left_plan = build_query_plan(db, *left)?;
-            let right_plan = build_query_plan(db, *right)?;
-            let mut combined_indexes = left_plan.indexes;
-            combined_indexes.extend(right_plan.indexes);
-            let mut combined_filters = left_plan.filters;
-            combined_filters.extend(right_plan.filters);
-            Ok(QueryPlan {
-                indexes: combined_indexes, // Combine indexes (might need smarter combination later)
-                filters: combined_filters,
-            })
-        }
-         QueryNode::Or(_, _) => {
-             // OR is more complex. Simplest approach: execute both sub-plans and union results.
-             // More advanced: cost-based analysis to pick the best plan or index intersection/union.
-             // For now, let's return an error or a basic plan that requires full scan + filtering.
-             error!("OR queries in AST are not fully implemented yet.");
-             Err(DbError::MissingData("OR queries in AST not fully implemented".to_string()))
-         }
-         QueryNode::Not(_) => {
-             // NOT is also complex. Often requires scanning and filtering.
-             error!("NOT queries in AST are not fully implemented yet.");
-             Err(DbError::MissingData("NOT queries in AST not fully implemented".to_string()))
-         }
-    }
+fn fetch_keys_hash_index(db: &Db, field_path: &str, value: &Value) -> DbResult<HashSet<String>> {
+    let index_key = get_field_index_key(field_path, &value.to_string().trim_matches('"'));
+    Ok(db.scan_prefix(index_key.as_bytes())
+        .filter_map(|res| res.ok())
+        .filter_map(|(_, v)| String::from_utf8(v.to_vec()).ok())
+        .collect::<HashSet<_>>())
 }
 
-pub fn execute_query_plan(db: &Db, plan: QueryPlan) -> DbResult<Vec<Value>> {
-    let mut candidate_keys = HashSet::new();
-    let mut first_index = true;
+fn fetch_keys_sorted_index(db: &Db, field_path: &str, operator: &str, value: &Value, _expected_type: &DataType) -> DbResult<HashSet<String>> {
+    let mut current_keys = HashSet::new();
+    let encoded_value = encode_sorted_value(value)?;
+    let value_type_byte = encoded_value.first().copied();
 
-    for index_or_prefix in plan.indexes {
-        let mut current_keys = HashSet::new();
-        // Check if it's a hash index key or a sorted index prefix
-        if index_or_prefix.starts_with(FIELD_INDEX_PREFIX) {
-            // Hash index lookup (points to a single primary key)
-             if let Some(key_bytes) = db.get(&index_or_prefix)? {
-                 if let Ok(key_str) = String::from_utf8(key_bytes.to_vec()) {
-                     current_keys.insert(key_str);
+    let prefix = get_field_sorted_index_prefix(field_path);
+    let prefix_bytes = prefix.as_bytes();
+
+    let start_key_gt = get_field_sorted_index_key(field_path, &encoded_value, "");
+    let start_key_gte = get_field_sorted_index_key(field_path, &encoded_value, "");
+    let end_key_lt = get_field_sorted_index_key(field_path, &encoded_value, "");
+    let end_key_lte = get_field_sorted_index_key(field_path, &encoded_value, "\u{FFFF}");
+
+    let range: (Bound<&[u8]>, Bound<&[u8]>) = match operator {
+         ">" => (Bound::Excluded(start_key_gt.as_bytes()), Bound::Unbounded),
+         ">=" => (Bound::Included(start_key_gte.as_bytes()), Bound::Unbounded),
+         "<" => (Bound::Included(prefix_bytes), Bound::Excluded(end_key_lt.as_bytes())),
+         "<=" => (Bound::Included(prefix_bytes), Bound::Included(end_key_lte.as_bytes())),
+         "!=" => (Bound::Unbounded, Bound::Unbounded),
+         _ => return Err(DbError::AstQueryError(format!("Unsupported operator for sorted index: {}", operator))),
+     };
+
+    let iterator = if operator == "!=" {
+        Box::new(db.scan_prefix(prefix_bytes)) as Box<dyn Iterator<Item = Result<(IVec, IVec), sled::Error>>>
+    } else {
+        Box::new(db.range::<&[u8], _>(range)) as Box<dyn Iterator<Item = Result<(IVec, IVec), sled::Error>>>
+    };
+
+    for item_result in iterator {
+        let (k, _) = item_result?;
+        let key_str = String::from_utf8_lossy(&k);
+
+        let parts: Vec<&str> = key_str.splitn(4, ':').collect();
+        if parts.len() < 4 { continue; }
+
+
+        let stored_field_path = parts[1];
+        if stored_field_path != field_path { continue; }
+
+        let stored_encoded_hex = parts[2];
+        let primary_key = parts[3];
+
+        if let Ok(stored_encoded) = hex::decode(stored_encoded_hex) {
+             if let Some(query_type) = value_type_byte {
+                 if stored_encoded.is_empty() || stored_encoded[0] != query_type {
+                     continue;
                  }
              }
-        } else if index_or_prefix.starts_with(FIELD_SORTED_INDEX_PREFIX) {
-            // Sorted index scan (prefix scan yields multiple index entries)
-            for item_result in db.scan_prefix(index_or_prefix.as_bytes()) {
-                 let (k, _) = item_result?;
-                 let key_str = String::from_utf8_lossy(&k);
-                 // Format: __field_sorted__{field}:{hex_encoded_value}:{primary_key}
-                 let parts: Vec<&str> = key_str.split(':').collect();
-                 if let Some(primary_key) = parts.last() { // Primary key is the last part
+
+             if let Ok(stored_value) = decode_sorted_value(&stored_encoded) {
+                 let comparison_result = compare_values(&stored_value, value);
+
+                 let matches = match operator {
+                     ">" => comparison_result == Some(Ordering::Greater),
+                     "<" => comparison_result == Some(Ordering::Less),
+                     ">=" => comparison_result == Some(Ordering::Greater) || comparison_result == Some(Ordering::Equal),
+                     "<=" => comparison_result == Some(Ordering::Less) || comparison_result == Some(Ordering::Equal),
+                     "!=" => comparison_result != Some(Ordering::Equal),
+                     _ => false,
+                 };
+
+                 if matches {
                      current_keys.insert(primary_key.to_string());
                  }
-            }
+             } else {
+                  warn!("Failed to decode sorted value for key: {}", key_str);
+             }
         } else {
-             warn!("Unknown index/prefix type in query plan: {}", index_or_prefix);
-             // Potentially treat as full scan trigger if needed
-        }
-
-
-        if first_index {
-            candidate_keys = current_keys;
-            first_index = false;
-        } else {
-            // Intersect keys for AND logic (implicit in current plan structure)
-            candidate_keys = candidate_keys.intersection(&current_keys).cloned().collect();
+             warn!("Failed to decode hex for sorted key: {}", key_str);
         }
     }
+    Ok(current_keys)
+}
 
-    // Fetch and filter results
-    let mut final_results = Vec::new();
-    for key in candidate_keys {
-        if let Ok(value) = get_key(db, &key) {
-            let mut passes_filters = true;
-            for filter in &plan.filters {
-                if !(filter.0)(&value) { // Apply the filter closure
-                    passes_filters = false;
-                    break;
-                }
-            }
-            if passes_filters {
-                final_results.push(value);
-            }
-        } else {
-             warn!("Key {} found in index but not in main store.", key);
+fn fetch_documents(db: &Db, keys: HashSet<String>) -> DbResult<Vec<Value>> {
+    keys.into_iter()
+        .map(|k| get_key(db, &k))
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq)]
+struct HashableValue(Value);
+
+impl PartialEq for HashableValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Hash for HashableValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let canonical_string = serde_json::to_string(&self.0).unwrap_or_default();
+        canonical_string.hash(state);
+    }
+}
+
+
+fn evaluate_condition_on_doc(doc: &Value, field_path: &str, operator: &str, query_value: &Value) -> bool {
+     if let Some(doc_value) = get_value_by_path(doc, field_path) {
+         match operator {
+             "Eq" => doc_value == query_value,
+             "Includes" => {
+                 if let Some(arr) = doc_value.as_array() {
+                     arr.contains(query_value)
+                 } else {
+                     doc_value == query_value
+                 }
+             }
+             "Gt" | "Lt" | "Gte" | "Lte" | "Ne" => {
+                 let comparison_result = compare_values(doc_value, query_value);
+                 match operator {
+                     "Gt" => comparison_result == Some(Ordering::Greater),
+                     "Lt" => comparison_result == Some(Ordering::Less),
+                     "Gte" => comparison_result == Some(Ordering::Greater) || comparison_result == Some(Ordering::Equal),
+                     "Lte" => comparison_result == Some(Ordering::Less) || comparison_result == Some(Ordering::Equal),
+                     "Ne" => comparison_result != Some(Ordering::Equal),
+                     _ => false,
+                 }
+             }
+             _ => false,
+         }
+     } else {
+         let parts: Vec<&str> = field_path.split('.').collect();
+         if parts.len() > 1 {
+             let parent_path = parts[..parts.len()-1].join(".");
+             if let Some(Value::Array(arr)) = get_value_by_path(doc, &parent_path) {
+                 let last_part = parts.last().unwrap();
+                 return arr.iter().any(|elem| {
+                     if let Some(nested_val) = elem.get(*last_part) {
+                         evaluate_condition_on_doc(nested_val, "", operator, query_value)
+                     } else { false }
+                 });
+             }
+         }
+         false
+     }
+}
+
+fn get_all_keys(db: &Db) -> DbResult<HashSet<String>> {
+     let mut keys = HashSet::new();
+     for result in db.iter() {
+         let (key_bytes, _) = result?;
+         if !key_bytes.starts_with(GEO_SORTED_INDEX_PREFIX.as_bytes()) &&
+            !key_bytes.starts_with(FIELD_INDEX_PREFIX.as_bytes()) &&
+            !key_bytes.starts_with(FIELD_SORTED_INDEX_PREFIX.as_bytes()) {
+             if let Ok(key_str) = String::from_utf8(key_bytes.to_vec()) {
+                 keys.insert(key_str);
+             } else {
+                 warn!("Found non-UTF8 key in database during get_all_keys");
+             }
+         }
+     }
+     Ok(keys)
+ }
+
+
+pub fn execute_ast_query(
+    db: &Db,
+    query_node: QueryNode,
+    projection: Option<Vec<String>>,
+    limit: Option<usize>,
+    offset: Option<usize>
+) -> DbResult<Vec<Value>> {
+
+    let mut results = match query_node {
+        QueryNode::Eq(field, value, _expected_type) => {
+            let keys = fetch_keys_hash_index(db, &field, &value)?;
+            let docs = fetch_documents(db, keys)?;
+            docs.into_iter()
+                .filter(|doc| evaluate_condition_on_doc(doc, &field, "Eq", &value))
+                .collect()
         }
+        QueryNode::Includes(field, value, _expected_type) => {
+             let keys = fetch_keys_hash_index(db, &field, &value)?;
+             let docs = fetch_documents(db, keys)?;
+             docs.into_iter()
+                 .filter(|doc| evaluate_condition_on_doc(doc, &field, "Includes", &value))
+                 .collect()
+         }
+        QueryNode::Gt(field, value, expected_type) => {
+            let keys = fetch_keys_sorted_index(db, &field, ">", &value, &expected_type)?;
+            fetch_documents(db, keys)?
+        }
+        QueryNode::Lt(field, value, expected_type) => {
+            let keys = fetch_keys_sorted_index(db, &field, "<", &value, &expected_type)?;
+            fetch_documents(db, keys)?
+        }
+        QueryNode::Gte(field, value, expected_type) => {
+            let keys = fetch_keys_sorted_index(db, &field, ">=", &value, &expected_type)?;
+            fetch_documents(db, keys)?
+        }
+        QueryNode::Lte(field, value, expected_type) => {
+            let keys = fetch_keys_sorted_index(db, &field, "<=", &value, &expected_type)?;
+            fetch_documents(db, keys)?
+        }
+        QueryNode::Ne(field, value, expected_type) => {
+            let keys = fetch_keys_sorted_index(db, &field, "!=", &value, &expected_type)?;
+            fetch_documents(db, keys)?
+        }
+        QueryNode::And(left, right) => {
+            let left_results = execute_ast_query(db, *left, None, None, None)?;
+            let right_results = execute_ast_query(db, *right, None, None, None)?;
+
+            let left_set: HashSet<HashableValue> = left_results.into_iter().map(HashableValue).collect();
+            let right_set: HashSet<HashableValue> = right_results.into_iter().map(HashableValue).collect();
+
+            left_set.intersection(&right_set).cloned().map(|hv| hv.0).collect()
+        }
+         QueryNode::Or(left, right) => {
+             let left_results = execute_ast_query(db, *left, None, None, None)?;
+             let right_results = execute_ast_query(db, *right, None, None, None)?;
+
+             let mut combined_set: HashSet<HashableValue> = left_results.into_iter().map(HashableValue).collect();
+             for val in right_results {
+                 combined_set.insert(HashableValue(val));
+             }
+
+             combined_set.into_iter().map(|hv| hv.0).collect()
+         }
+         QueryNode::Not(child_node) => {
+             // Inefficient NOT implementation: Fetch all, fetch excluded, filter
+             let all_docs = get_all_keys(db)?.into_iter()
+                 .map(|k| get_key(db, &k))
+                 .collect::<DbResult<Vec<Value>>>()?;
+
+             let excluded_docs = execute_ast_query(db, *child_node, None, None, None)?;
+             let excluded_set: HashSet<HashableValue> = excluded_docs.into_iter().map(HashableValue).collect();
+
+             all_docs.into_iter()
+                 .filter(|doc| !excluded_set.contains(&HashableValue(doc.clone()))) // Clone needed for check
+                 .collect()
+         }
+         QueryNode::GeoWithinRadius { field, lat, lon, radius } => {
+              query_within_radius_simplified(db, &field, lat, lon, radius)?
+         }
+         QueryNode::GeoInBox { field, min_lat, min_lon, max_lat, max_lon } => {
+              query_in_box(db, &field, min_lat, min_lon, max_lat, max_lon)?
+         }
+    };
+
+    // Apply Pagination
+    let start = offset.unwrap_or(0);
+    // let _end = start + limit.unwrap_or(usize::MAX); // _end is unused
+    if start < results.len() {
+         let limit_count = limit.unwrap_or(results.len() - start);
+         results = results.into_iter().skip(start).take(limit_count).collect();
+    } else {
+         results = vec![];
     }
 
-    Ok(final_results)
+
+    // Apply Projection
+    if let Some(proj_paths) = projection {
+        apply_projection(results, &proj_paths)
+    } else {
+        Ok(results)
+    }
 }
 
 
@@ -637,8 +951,7 @@ pub fn export_data(db: &Db) -> DbResult<String> {
     let mut data = Vec::new();
     for result in db.iter() {
         let (key, value) = result?;
-        // Exclude all index entries
-        if !key.starts_with(GEO_INDEX_PREFIX.as_bytes()) &&
+        if !key.starts_with(GEO_SORTED_INDEX_PREFIX.as_bytes()) &&
            !key.starts_with(FIELD_INDEX_PREFIX.as_bytes()) &&
            !key.starts_with(FIELD_SORTED_INDEX_PREFIX.as_bytes()) {
             let key_str = String::from_utf8(key.to_vec())?;
@@ -649,7 +962,7 @@ pub fn export_data(db: &Db) -> DbResult<String> {
     Ok(serde_json::to_string(&data)?)
 }
 
-pub fn import_data(db: &Db, data: &str) -> DbResult<()> {
+pub fn import_data(db: &Db, data: &str, config: &DbConfig) -> DbResult<()> {
     let json_data: Vec<Value> = serde_json::from_str(data)?;
     for item in json_data {
         let key = item.get("key")
@@ -657,127 +970,188 @@ pub fn import_data(db: &Db, data: &str) -> DbResult<()> {
             .ok_or_else(|| DbError::ImportError("Invalid key format".to_string()))?;
         let value_json = item.get("value")
             .ok_or_else(|| DbError::ImportError("Missing value".to_string()))?;
-        // Use set_key to ensure indexes are rebuilt during import
-        set_key(db, key, value_json.clone())?;
+
+        set_key(db, key, value_json.clone(), config)?;
     }
     Ok(())
 }
 
-fn index_geospatial_field(tx_db: &sled::transaction::TransactionalTree, key: &str, field: &str, point: &GeoPoint) -> DbResult<()> {
+fn index_geospatial_field(tx_db: &TransactionalTree, key: &str, field_path: &str, point: &GeoPoint) -> DbResult<()> {
     let coord: Coord<f64> = point.clone().into();
     let hash = encode(coord, GEOHASH_PRECISION).map_err(|e| DbError::Geohash(e.to_string()))?;
-    debug!(key=key, field=field, hash=hash, "Indexing geo field (transactional)");
-    let geo_entry = GeoEntry {
-        key: key.to_string(),
-        geohash: hash.clone(),
-        point: point.clone(),
-    };
-    let index_key = get_geo_index_key(field, &hash);
-    let index_key_bytes = index_key.as_bytes();
-    let current_value_opt = tx_db.get(index_key_bytes)?;
-    let mut entries = current_value_opt
-        .as_ref()
-        .and_then(|ivec| serde_json::from_slice::<Vec<GeoEntry>>(ivec).ok())
-        .unwrap_or_default();
-    if !entries.iter().any(|entry| entry.key == key) {
-        entries.push(geo_entry.clone());
-    } else {
-        debug!(key=key, field=field, hash=hash, "Key already exists in geo index, skipping update (transactional)");
-        return Ok(());
-    }
-    let serialized_entries = serde_json::to_vec(&entries)?;
-    tx_db.insert(index_key_bytes, serialized_entries)?;
-    debug!(key=key, field=field, hash=hash, "Successfully updated geo index (transactional)");
+    let index_key = get_geo_sorted_index_key(field_path, &hash, key);
+    debug!(key=key, field_path=field_path, hash=hash, index_key=%index_key, "Indexing geo field (transactional)");
+    tx_db.insert(index_key.as_bytes(), vec![])?;
+    debug!(key=key, field_path=field_path, hash=hash, index_key=%index_key, "Successfully inserted geo sorted index (transactional)");
     Ok(())
 }
 
-fn remove_geospatial_index(tx_db: &sled::transaction::TransactionalTree, key: &str, field: &str, point: &GeoPoint) -> DbResult<()> {
+fn remove_geospatial_index(tx_db: &TransactionalTree, key: &str, field_path: &str, point: &GeoPoint) -> DbResult<()> {
     let coord: Coord<f64> = point.clone().into();
     let hash = encode(coord, GEOHASH_PRECISION).map_err(|e| DbError::Geohash(e.to_string()))?;
-    let index_key = get_geo_index_key(field, &hash);
-    let index_key_bytes = index_key.as_bytes();
-    debug!(key=key, field=field, hash=hash, "Removing geo index (transactional)");
-    let current_value_opt = tx_db.get(index_key_bytes)?;
-    if let Some(ivec) = current_value_opt {
-        if let Ok(mut entries) = serde_json::from_slice::<Vec<GeoEntry>>(&ivec) {
-            let initial_len = entries.len();
-            entries.retain(|entry| entry.key != key);
-            if entries.len() < initial_len {
-                if entries.is_empty() {
-                    tx_db.remove(index_key_bytes)?;
-                    debug!(key=key, field=field, hash=hash, "Successfully removed entry and index key from geo index (transactional)");
-                } else {
-                    let next_value_bytes = serde_json::to_vec(&entries)?;
-                    tx_db.insert(index_key_bytes, next_value_bytes)?;
-                    debug!(key=key, field=field, hash=hash, "Successfully removed entry from geo index (transactional)");
-                }
-            } else {
-                debug!(key=key, field=field, hash=hash, "Key not found in geo index entry, nothing to remove (transactional)");
-            }
-        } else {
-            warn!(key=key, field=field, hash=hash, "Failed to deserialize geo index entry during removal, skipping (transactional)");
-        }
-    } else {
-        debug!(key=key, field=field, hash=hash, "Geo index key not found, nothing to remove (transactional)");
-    }
+    let index_key = get_geo_sorted_index_key(field_path, &hash, key);
+    debug!(key=key, field_path=field_path, hash=hash, index_key=%index_key, "Removing geo sorted index (transactional)");
+    tx_db.remove(index_key.as_bytes())?;
+    debug!(key=key, field_path=field_path, hash=hash, index_key=%index_key, "Successfully removed geo sorted index (transactional)");
     Ok(())
 }
 
-// Geospatial Queries
-pub fn query_within_radius_simplified(db: &Db, field: &str, center_lat: f64, center_lon: f64, radius_meters: f64) -> DbResult<Vec<Value>> {
+pub fn query_within_radius_simplified(db: &Db, field_path: &str, center_lat: f64, center_lon: f64, radius_meters: f64) -> DbResult<Vec<Value>> {
+    use geo::prelude::Distance; // Import the trait for .distance()
+
     let center_point_geo: Point<f64> = GeoPoint { lat: center_lat, lon: center_lon }.into();
     let center_coord_geo: Coord<f64> = GeoPoint { lat: center_lat, lon: center_lon }.into();
-    // Note: This simplified version only checks the geohash bucket of the center point.
-    // A full implementation would check neighboring geohashes as well.
     let center_hash = encode(center_coord_geo, GEOHASH_PRECISION).map_err(|e| DbError::Geohash(e.to_string()))?;
+
+    let neighbors: Neighbors = geohash_neighbors(&center_hash).map_err(|e| DbError::Geohash(e.to_string()))?;
+    let mut hashes_to_check = vec![center_hash.clone()];
+    hashes_to_check.extend([neighbors.n, neighbors.ne, neighbors.e, neighbors.se, neighbors.s, neighbors.sw, neighbors.w, neighbors.nw]);
+
     let mut results_map: HashMap<String, Value> = HashMap::new();
-    let index_key = get_geo_index_key(field, &center_hash);
-    if let Some(ivec) = db.get(&index_key)? {
-        if let Ok(entries) = serde_json::from_slice::<Vec<GeoEntry>>(&ivec) {
-            for entry in entries {
-                let entry_point: Point<f64> = entry.point.into();
-                // Reverted to haversine_distance, relying on prelude import
-                let distance = entry_point.haversine_distance(&center_point_geo);
-                if distance <= radius_meters {
-                    if !results_map.contains_key(&entry.key) {
-                        match get_key(db, &entry.key) {
-                            Ok(value) => { results_map.insert(entry.key.clone(), value); },
-                            Err(DbError::NotFound) => warn!(key=entry.key, "Geo index points to non-existent key"),
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
+
+
+    for hash in hashes_to_check {
+        let prefix = get_geo_sorted_index_prefix_for_hash(field_path, &hash);
+        for item_result in db.scan_prefix(prefix.as_bytes()) {
+            let (index_key_bytes, _) = item_result?;
+            let index_key_str = String::from_utf8_lossy(&index_key_bytes);
+            let parts: Vec<&str> = index_key_str.split(':').collect();
+
+            if parts.len() < 4 {
+                 warn!("Invalid geo sorted index key format: {}", index_key_str);
+                 continue;
+            }
+            let stored_field_path = parts[1];
+            if stored_field_path != field_path { continue; }
+
+            if let Some(primary_key) = parts.last() {
+                 if results_map.contains_key(*primary_key) {
+                     continue;
+                 }
+
+                 match get_key(db, primary_key) {
+                     Ok(value) => {
+                         if let Some(point_val) = get_value_by_path(&value, field_path) {
+                             if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(point_val.clone()) {
+                                 let entry_point: Point<f64> = geo_point.into();
+
+                                 let distance = entry_point.haversine_distance(&center_point_geo);
+                                 if distance <= radius_meters {
+                                     results_map.insert(primary_key.to_string(), value);
+                                 }
+
+                             } else {
+                                 warn!(key = primary_key, field_path = field_path, "Field is not a valid GeoPoint");
+                             }
+                         } else {
+                              warn!(key = primary_key, field_path = field_path, "Geo field not found in document");
+                         }
+                     },
+                     Err(DbError::NotFound) => warn!(key = primary_key, "Geo index points to non-existent key"),
+                     Err(e) => return Err(e),
+                 }
+            } else {
+                 warn!("Invalid geo sorted index key format (missing primary key?): {}", index_key_str);
             }
         }
     }
     Ok(results_map.into_values().collect())
 }
 
-pub fn query_in_box(db: &Db, field: &str, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> DbResult<Vec<Value>> {
+pub fn query_in_box(db: &Db, field_path: &str, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> DbResult<Vec<Value>> {
+
     let bounding_box = Rect::new(
         Coord { x: min_lon, y: min_lat },
         Coord { x: max_lon, y: max_lat },
     );
-    let prefix = format!("{}{}:", GEO_INDEX_PREFIX, field);
+    let prefix = get_geo_sorted_index_prefix_for_field(field_path);
     let mut results_map: HashMap<String, Value> = HashMap::new();
-    // Note: This scans ALL geo index entries for the field.
-    // A more optimized version would use geohash prefixes to narrow the scan.
+
     for item_result in db.scan_prefix(prefix.as_bytes()) {
-        let (_key, value_ivec) = item_result?;
-        if let Ok(entries) = serde_json::from_slice::<Vec<GeoEntry>>(&value_ivec) {
-            for entry in entries {
-                let entry_point: Point<f64> = entry.point.into();
-                if bounding_box.contains(&entry_point) { // Use contains method from prelude
-                    if !results_map.contains_key(&entry.key) {
-                        match get_key(db, &entry.key) {
-                            Ok(value) => { results_map.insert(entry.key.clone(), value); },
-                            Err(DbError::NotFound) => warn!(key=entry.key, "Geo index points to non-existent key"),
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-            }
+        let (index_key_bytes, _) = item_result?;
+        let index_key_str = String::from_utf8_lossy(&index_key_bytes);
+        let parts: Vec<&str> = index_key_str.split(':').collect();
+
+         if parts.len() < 4 {
+              warn!("Invalid geo sorted index key format: {}", index_key_str);
+              continue;
+         }
+         let stored_field_path = parts[1];
+         if stored_field_path != field_path { continue; }
+
+
+         if let Some(primary_key) = parts.last() {
+             if results_map.contains_key(*primary_key) {
+                 continue;
+             }
+
+             match get_key(db, primary_key) {
+                 Ok(value) => {
+                     if let Some(point_val) = get_value_by_path(&value, field_path) {
+                         if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(point_val.clone()) {
+                             let entry_point: Point<f64> = geo_point.into();
+                             if bounding_box.contains(&entry_point) {
+                                 results_map.insert(primary_key.to_string(), value);
+                             }
+                         } else {
+                             warn!(key = primary_key, field_path = field_path, "Field is not a valid GeoPoint");
+                         }
+                     } else {
+                          warn!(key = primary_key, field_path = field_path, "Geo field not found in document");
+                     }
+                 },
+                 Err(DbError::NotFound) => warn!(key = primary_key, "Geo index points to non-existent key"),
+                 Err(e) => return Err(e),
+             }
+        } else {
+             warn!("Invalid geo sorted index key format (missing primary key?): {}", index_key_str);
         }
     }
     Ok(results_map.into_values().collect())
+}
+
+// Simulates deleting a "table" by removing all keys with a given prefix
+pub fn clear_prefix(db: &Db, prefix: &str, config: &DbConfig) -> DbResult<usize> {
+    let keys_to_delete: Vec<String> = db.scan_prefix(prefix.as_bytes())
+        .keys()
+        .filter_map(|res| res.ok())
+        .filter_map(|key_bytes| String::from_utf8(key_bytes.to_vec()).ok())
+        .filter(|key_str| {
+            !key_str.starts_with(GEO_SORTED_INDEX_PREFIX) &&
+            !key_str.starts_with(FIELD_INDEX_PREFIX) &&
+            !key_str.starts_with(FIELD_SORTED_INDEX_PREFIX)
+        })
+        .collect();
+
+    let count = keys_to_delete.len();
+
+    if count > 0 {
+        db.transaction(|tx_db| {
+            for key in &keys_to_delete {
+                delete_key_internal(tx_db, key, config)
+                    .map_err(|e| ConflictableTransactionError::Abort(DbError::TransactionOperationFailed(format!("Clear prefix failed for key '{}': {}", key, e))))?;
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(count)
+}
+
+// Clears all user data from the database
+pub fn drop_database(db: &Db, config: &DbConfig) -> DbResult<usize> {
+    let all_keys = get_all_keys(db)?;
+    let count = all_keys.len();
+
+    if count > 0 {
+        db.transaction(|tx_db| {
+            for key in &all_keys {
+                delete_key_internal(tx_db, key, config)
+                    .map_err(|e| ConflictableTransactionError::Abort(DbError::TransactionOperationFailed(format!("Drop database failed for key '{}': {}", key, e))))?;
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(count)
 }
