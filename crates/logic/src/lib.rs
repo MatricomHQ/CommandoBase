@@ -1,13 +1,13 @@
 use serde::{Serialize, Deserialize, de::Error as SerdeError};
-use serde_json::{Value, json, Map};
+use serde_json::{Value, json}; // Removed Map
 use sled::{Db, transaction::{TransactionError, UnabortableTransactionError, ConflictableTransactionError}};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::{error, debug, warn};
-use geo::{Coord, Point, Rect, prelude::*};
+use geo::{Coord, Point, Rect, prelude::*}; // Prelude includes HaversineDistance trait
+// Removed: use geo::prelude::Distance;
 use geohash::encode;
-use geo::HaversineDistance;
-use std::convert::{Infallible, TryInto};
+use std::convert::TryInto; // Removed Infallible
 use std::cmp::Ordering;
 use hex;
 use lazy_static::lazy_static;
@@ -736,6 +736,7 @@ pub fn query_within_radius_simplified(db: &Db, field: &str, center_lat: f64, cen
         if let Ok(entries) = serde_json::from_slice::<Vec<GeoEntry>>(&ivec) {
             for entry in entries {
                 let entry_point: Point<f64> = entry.point.into();
+                // Reverted to haversine_distance, relying on prelude import
                 let distance = entry_point.haversine_distance(&center_point_geo);
                 if distance <= radius_meters {
                     if !results_map.contains_key(&entry.key) {
@@ -766,7 +767,7 @@ pub fn query_in_box(db: &Db, field: &str, min_lat: f64, min_lon: f64, max_lat: f
         if let Ok(entries) = serde_json::from_slice::<Vec<GeoEntry>>(&value_ivec) {
             for entry in entries {
                 let entry_point: Point<f64> = entry.point.into();
-                if bounding_box.contains(&entry_point) {
+                if bounding_box.contains(&entry_point) { // Use contains method from prelude
                     if !results_map.contains_key(&entry.key) {
                         match get_key(db, &entry.key) {
                             Ok(value) => { results_map.insert(entry.key.clone(), value); },
