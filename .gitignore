@@ -1,0 +1,5 @@
+target/
+bun_db_wrapper/node_modules/
+bun_db_wrapper/bun.lock
+deploy_key
+deploy_key.pub
