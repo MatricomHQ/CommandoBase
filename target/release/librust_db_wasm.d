@@ -1,1 +1,1 @@
-/Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/target/release/librust_db_wasm.rlib: /Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/crates/logic/src/lib.rs /Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/crates/wasm/src/lib.rs
+/Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/target/release/librust_db_wasm.dylib: /Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/crates/logic/src/lib.rs /Users/kristopherbaylog/Documents/Projects/RustObjectDatabase/crates/wasm/src/lib.rs

@@ -11,7 +11,7 @@ use serde_json::Value;
 use sled::Db;
 use std::sync::Arc;
 use std::path::PathBuf;
-use std::fs; 
+use std::fs;
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, error, Level, instrument};
@@ -224,7 +224,9 @@ async fn query_ast_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryAstPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-    let plan = logic::build_query_plan(&state.db, payload.ast);
+    // Handle the Result from build_query_plan first
+    let plan = logic::build_query_plan(&state.db, payload.ast)?;
+    // Now pass the unwrapped plan
     let results = logic::execute_query_plan(&state.db, plan)?;
     Ok(Json(results))
 }
@@ -265,10 +267,13 @@ impl IntoResponse for AppError {
                 logic::DbError::ImportError(msg) => (StatusCode::BAD_REQUEST, format!("Import failed: {}", msg)),
                 logic::DbError::CasRetryLimit(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database concurrency error".to_string()),
                 logic::DbError::Utf8Error(_) => (StatusCode::BAD_REQUEST, "Invalid UTF-8 data".to_string()),
+                logic::DbError::HexError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal encoding error".to_string()), // Added
+                logic::DbError::TryFromSlice(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal byte conversion error".to_string()), // Added
                 logic::DbError::NotFound => (StatusCode::NOT_FOUND, "Key not found".to_string()),
-                logic::DbError::MissingData(field) => (StatusCode::BAD_REQUEST, format!("Missing field: {}", field)),
+                logic::DbError::MissingData(field) => (StatusCode::BAD_REQUEST, format!("Missing or invalid data: {}", field)), // Modified message slightly
                 logic::DbError::Transaction(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Transaction error: {}", msg)),
                 logic::DbError::Io(io_err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("IO error: {}", io_err)),
+                logic::DbError::InvalidComparisonValue(msg) => (StatusCode::BAD_REQUEST, format!("Invalid value for comparison: {}", msg)), // Added
             },
             AppError::Json(json_err) => (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", json_err)),
         };

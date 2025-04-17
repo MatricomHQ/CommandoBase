@@ -10,4 +10,7 @@ serde_json = "1.0.140"
 geohash = "0.13.1"
 geo = { version = "0.30.0", features = ["serde"] }
 thiserror = "1.0"
-tracing = "0.1" # Keep for potential logging within logic
+tracing = "0.1"
+hex = "0.4"
+lazy_static = "1.4.0"
+regex = "1"

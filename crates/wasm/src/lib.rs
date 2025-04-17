@@ -83,11 +83,11 @@ pub fn query_and(conditions_str: &str) -> Result<JsValue, JsValue> {
     let db = get_db()?;
     let conditions: Vec<(String, String, String)> = serde_json::from_str(conditions_str)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse conditions: {}", e)))?;
-    
+
     let conditions_owned: Vec<(&str, &str, &str)> = conditions.iter()
         .map(|(f, o, v)| (f.as_str(), o.as_str(), v.as_str()))
         .collect();
-    
+
     let results = logic::query_and(db, conditions_owned).map_err(map_logic_error)?;
     serde_wasm_bindgen::to_value(&results).map_err(|e| JsValue::from_str(&format!("SerdeWasmBindgen error: {}", e)))
 }
@@ -97,7 +97,9 @@ pub fn query_ast(query_node_str: &str) -> Result<JsValue, JsValue> {
     let db = get_db()?;
     let query_node: logic::QueryNode = serde_json::from_str(query_node_str)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse AST query: {}", e)))?;
-    let plan = logic::build_query_plan(db, query_node);
+    // Handle the Result from build_query_plan
+    let plan = logic::build_query_plan(db, query_node).map_err(map_logic_error)?;
+    // Pass the unwrapped plan to execute_query_plan
     let results = logic::execute_query_plan(db, plan).map_err(map_logic_error)?;
     serde_wasm_bindgen::to_value(&results).map_err(|e| JsValue::from_str(&format!("SerdeWasmBindgen error: {}", e)))
 }
