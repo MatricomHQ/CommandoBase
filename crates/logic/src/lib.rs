@@ -67,6 +67,8 @@ pub enum DbError {
     InvalidPath(String),
     #[error("Transaction operation failed: {0}")]
     TransactionOperationFailed(String),
+    #[error("Invalid Field Index Key format: {0}")] // Added
+    InvalidFieldIndexKey(String),
 }
 
 impl From<TransactionError<DbError>> for DbError {
@@ -123,8 +125,14 @@ fn get_geo_sorted_index_prefix_for_field(field_path: &str) -> String {
 }
 
 
-fn get_field_index_key(field_path: &str, value: &str) -> String {
-    format!("{}{}:{}", FIELD_INDEX_PREFIX, field_path, value)
+// Modified: Include primary_key
+fn get_field_index_key(field_path: &str, value: &str, primary_key: &str) -> String {
+    format!("{}{}:{}:{}", FIELD_INDEX_PREFIX, field_path, value, primary_key)
+}
+
+// Added: Prefix for scanning hash index
+fn get_field_index_prefix(field_path: &str, value: &str) -> String {
+    format!("{}{}:{}:", FIELD_INDEX_PREFIX, field_path, value)
 }
 
 fn get_field_sorted_index_key(field_path: &str, encoded_value: &[u8], key: &str) -> String {
@@ -243,7 +251,7 @@ fn compare_values(v1: &Value, v2: &Value) -> Option<Ordering> {
 
 fn index_value_recursive(
     tx_db: &TransactionalTree,
-    key: &str,
+    key: &str, // primary key
     current_path: &str,
     value: &Value,
     config: &DbConfig,
@@ -278,8 +286,9 @@ fn index_value_recursive(
                 if config.hash_indexed_fields.contains(current_path) {
                      if !elem.is_object() && !elem.is_array() { // Only index primitives directly
                          let elem_str = elem.to_string().trim_matches('"').to_string();
-                         let index_key = get_field_index_key(current_path, &elem_str);
-                         batch.insert(index_key.as_bytes(), key.as_bytes());
+                         // Modified: Use new key format, insert empty value
+                         let index_key = get_field_index_key(current_path, &elem_str, key);
+                         batch.insert(index_key.as_bytes(), vec![]);
                      }
                 }
                  // Index sortable primitive values within the array against the array's path
@@ -294,8 +303,9 @@ fn index_value_recursive(
         _ => { // Primitive value
             if config.hash_indexed_fields.contains(current_path) {
                 let value_str = value.to_string().trim_matches('"').to_string();
-                let index_key = get_field_index_key(current_path, &value_str);
-                batch.insert(index_key.as_bytes(), key.as_bytes());
+                // Modified: Use new key format, insert empty value
+                let index_key = get_field_index_key(current_path, &value_str, key);
+                batch.insert(index_key.as_bytes(), vec![]);
             }
             if config.sorted_indexed_fields.contains(current_path) {
                 if let Ok(encoded) = encode_sorted_value(value) {
@@ -310,7 +320,7 @@ fn index_value_recursive(
 
 fn remove_indices_recursive(
     tx_db: &TransactionalTree,
-    key: &str,
+    key: &str, // primary key
     current_path: &str,
     value: &Value,
     config: &DbConfig,
@@ -342,7 +352,8 @@ fn remove_indices_recursive(
                  if config.hash_indexed_fields.contains(current_path) {
                      if !elem.is_object() && !elem.is_array() {
                          let elem_str = elem.to_string().trim_matches('"').to_string();
-                         let index_key = get_field_index_key(current_path, &elem_str);
+                         // Modified: Use new key format for removal
+                         let index_key = get_field_index_key(current_path, &elem_str, key);
                          batch.remove(index_key.as_bytes());
                      }
                  }
@@ -357,7 +368,8 @@ fn remove_indices_recursive(
         _ => { // Primitive value
             if config.hash_indexed_fields.contains(current_path) {
                 let value_str = value.to_string().trim_matches('"').to_string();
-                let index_key = get_field_index_key(current_path, &value_str);
+                // Modified: Use new key format for removal
+                let index_key = get_field_index_key(current_path, &value_str, key);
                 batch.remove(index_key.as_bytes());
             }
             if config.sorted_indexed_fields.contains(current_path) {
@@ -399,10 +411,11 @@ pub fn set_key(db: &Db, key: &str, value: Value, config: &DbConfig) -> DbResult<
     Ok(())
 }
 
+// Modified: Make fields public
 #[derive(Deserialize, Debug)]
 pub struct BatchSetItem {
-    key: String,
-    value: Value,
+    pub key: String,
+    pub value: Value,
 }
 
 pub fn batch_set(db: &Db, items: &[BatchSetItem], config: &DbConfig) -> DbResult<()> { // Take slice
@@ -622,11 +635,8 @@ pub fn query_and(db: &Db, conditions: Vec<(&str, &str, &str)>) -> DbResult<Vec<V
         match *operator {
             "===" | "includes" => {
                 let value_parsed = parse_value(value_str)?;
-                let index_key = get_field_index_key(field, &value_parsed.to_string().trim_matches('"'));
-                current_keys = db.scan_prefix(index_key.as_bytes())
-                    .filter_map(|res| res.ok())
-                    .filter_map(|(_, v)| String::from_utf8(v.to_vec()).ok())
-                    .collect::<HashSet<_>>();
+                // Modified: Use fetch_keys_hash_index
+                current_keys = fetch_keys_hash_index(db, field, &value_parsed)?;
             }
             ">" | "<" | ">=" | "<=" | "!=" => {
                 let value = parse_value(value_str)?;
@@ -679,12 +689,27 @@ pub enum QueryNode {
 }
 
 
+// Modified: Fetch keys by scanning prefix and parsing primary key from index key
 fn fetch_keys_hash_index(db: &Db, field_path: &str, value: &Value) -> DbResult<HashSet<String>> {
-    let index_key = get_field_index_key(field_path, &value.to_string().trim_matches('"'));
-    Ok(db.scan_prefix(index_key.as_bytes())
-        .filter_map(|res| res.ok())
-        .filter_map(|(_, v)| String::from_utf8(v.to_vec()).ok())
-        .collect::<HashSet<_>>())
+    let value_str = value.to_string().trim_matches('"').to_string();
+    let prefix = get_field_index_prefix(field_path, &value_str);
+    let mut primary_keys = HashSet::new();
+
+    for result in db.scan_prefix(prefix.as_bytes()) {
+        let (index_key_bytes, _) = result?;
+        let index_key_str = String::from_utf8_lossy(&index_key_bytes);
+
+        // Extract primary key from the end of the index key string
+        // Format: __field_index__:<field_path>:<value_str>:<primary_key>
+        if let Some(primary_key) = index_key_str.split(':').last() {
+            primary_keys.insert(primary_key.to_string());
+        } else {
+             warn!("Invalid field index key format encountered during scan: {}", index_key_str);
+             // Optionally return an error:
+             return Err(DbError::InvalidFieldIndexKey(index_key_str.into_owned()));
+        }
+    }
+    Ok(primary_keys)
 }
 
 fn fetch_keys_sorted_index(db: &Db, field_path: &str, operator: &str, value: &Value, _expected_type: &DataType) -> DbResult<HashSet<String>> {
@@ -848,22 +873,32 @@ pub fn execute_ast_query(
     query_node: QueryNode,
     projection: Option<Vec<String>>,
     limit: Option<usize>,
-    offset: Option<usize>
+    offset: Option<usize>,
+    config: &DbConfig, // Added config parameter
 ) -> DbResult<Vec<Value>> {
 
     let mut results = match query_node {
-        QueryNode::Eq(field, value, _expected_type) => {
-            let keys = fetch_keys_hash_index(db, &field, &value)?;
-            let docs = fetch_documents(db, keys)?;
-            docs.into_iter()
-                .filter(|doc| evaluate_condition_on_doc(doc, &field, "Eq", &value))
-                .collect()
+        QueryNode::Eq(ref field, ref value, _) => { // Borrow field and value
+            let keys = fetch_keys_hash_index(db, field, value)?;
+            if keys.is_empty() && config.hash_indexed_fields.contains(field) {
+                // Fallback for dynamically indexed field with missing entries
+                warn!("Index entries missing for dynamically indexed field '{}'. Falling back to full scan.", field);
+                let all_keys = get_all_keys(db)?;
+                let all_docs = fetch_documents(db, all_keys)?;
+                all_docs.into_iter()
+                    .filter(|doc| evaluate_condition_on_doc(doc, field, "Eq", value))
+                    .collect()
+            } else {
+                fetch_documents(db, keys)?
+            }
         }
-        QueryNode::Includes(field, value, _expected_type) => {
-             let keys = fetch_keys_hash_index(db, &field, &value)?;
+        QueryNode::Includes(ref field, ref value, _) => { // Borrow field and value
+             let keys = fetch_keys_hash_index(db, field, value)?;
+             // Fallback logic similar to Eq could be added here if needed,
+             // but Includes often requires post-filtering anyway.
              let docs = fetch_documents(db, keys)?;
              docs.into_iter()
-                 .filter(|doc| evaluate_condition_on_doc(doc, &field, "Includes", &value))
+                 .filter(|doc| evaluate_condition_on_doc(doc, field, "Includes", value))
                  .collect()
          }
         QueryNode::Gt(field, value, expected_type) => {
@@ -887,8 +922,8 @@ pub fn execute_ast_query(
             fetch_documents(db, keys)?
         }
         QueryNode::And(left, right) => {
-            let left_results = execute_ast_query(db, *left, None, None, None)?;
-            let right_results = execute_ast_query(db, *right, None, None, None)?;
+            let left_results = execute_ast_query(db, *left, None, None, None, config)?; // Pass config
+            let right_results = execute_ast_query(db, *right, None, None, None, config)?; // Pass config
 
             let left_set: HashSet<HashableValue> = left_results.into_iter().map(HashableValue).collect();
             let right_set: HashSet<HashableValue> = right_results.into_iter().map(HashableValue).collect();
@@ -896,8 +931,8 @@ pub fn execute_ast_query(
             left_set.intersection(&right_set).cloned().map(|hv| hv.0).collect()
         }
          QueryNode::Or(left, right) => {
-             let left_results = execute_ast_query(db, *left, None, None, None)?;
-             let right_results = execute_ast_query(db, *right, None, None, None)?;
+             let left_results = execute_ast_query(db, *left, None, None, None, config)?; // Pass config
+             let right_results = execute_ast_query(db, *right, None, None, None, config)?; // Pass config
 
              let mut combined_set: HashSet<HashableValue> = left_results.into_iter().map(HashableValue).collect();
              for val in right_results {
@@ -912,7 +947,7 @@ pub fn execute_ast_query(
                  .map(|k| get_key(db, &k))
                  .collect::<DbResult<Vec<Value>>>()?;
 
-             let excluded_docs = execute_ast_query(db, *child_node, None, None, None)?;
+             let excluded_docs = execute_ast_query(db, *child_node, None, None, None, config)?; // Pass config
              let excluded_set: HashSet<HashableValue> = excluded_docs.into_iter().map(HashableValue).collect();
 
              all_docs.into_iter()
@@ -997,7 +1032,7 @@ fn remove_geospatial_index(tx_db: &TransactionalTree, key: &str, field_path: &st
 }
 
 pub fn query_within_radius_simplified(db: &Db, field_path: &str, center_lat: f64, center_lon: f64, radius_meters: f64) -> DbResult<Vec<Value>> {
-    use geo::prelude::Distance; // Import the trait for .distance()
+    // use geo::prelude::Distance; // Import the trait for .distance() // Removed unused import
 
     let center_point_geo: Point<f64> = GeoPoint { lat: center_lat, lon: center_lon }.into();
     let center_coord_geo: Coord<f64> = GeoPoint { lat: center_lat, lon: center_lon }.into();
@@ -1035,6 +1070,7 @@ pub fn query_within_radius_simplified(db: &Db, field_path: &str, center_lat: f64
                              if let Ok(geo_point) = serde_json::from_value::<GeoPoint>(point_val.clone()) {
                                  let entry_point: Point<f64> = geo_point.into();
 
+                                 // Use Distance trait method
                                  let distance = entry_point.haversine_distance(&center_point_geo);
                                  if distance <= radius_meters {
                                      results_map.insert(primary_key.to_string(), value);

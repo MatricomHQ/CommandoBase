@@ -10,6 +10,19 @@ export interface ImportItem {
   value: any;
 }
 
+export interface BatchSetItem {
+    key: string;
+    value: any;
+}
+
+export type TransactionOperation =
+    | { type: 'set'; key: string; value: any }
+    | { type: 'delete'; key: string };
+
+export interface CountResponse {
+    count: number;
+}
+
 export type DataType = 'String' | 'Number' | 'Bool';
 
 export type AstNode =
@@ -29,6 +42,8 @@ export type AstNode =
 interface QueryAstPayload {
     ast: AstNode;
     projection?: string[];
+    limit?: number;
+    offset?: number;
 }
 
 interface SetPayload {
@@ -60,12 +75,25 @@ interface QueryBoxPayload {
     max_lon: number;
 }
 
+interface ClearPrefixPayload {
+    prefix: string;
+}
+
 export interface DatabaseConfig {
     host: string;
     port: number;
     protocol?: 'http' | 'https';
+    cacheTTL?: number;
 }
 
+class DatabaseError extends Error {
+  public code: number;
+  constructor(message: string, code: number) {
+    super(message);
+    this.name = 'DatabaseError';
+    this.code = code;
+  }
+}
 
 function inferType(value: any): DataType {
   const type = typeof value;
@@ -76,17 +104,42 @@ function inferType(value: any): DataType {
 }
 
 function setValueByPath(obj: any, path: string[], value: any): void {
+    if (!path || path.length === 0) {
+        throw new Error("Path cannot be empty for setValueByPath");
+    }
+
     let current = obj;
     for (let i = 0; i < path.length - 1; i++) {
         const part = path[i];
-        if (current[part] === undefined || typeof current[part] !== 'object' || current[part] === null) {
-            const nextPart = path[i+1];
-            current[part] = /^\d+$/.test(nextPart) ? [] : {};
+        const nextPart = path[i + 1];
+
+        if (part === undefined || part === null) {
+             throw new Error(`Invalid path segment at index ${i}`);
+        }
+
+        const nextPartIsIndex = nextPart !== undefined && /^\d+$/.test(nextPart);
+
+        if (current[part] === undefined || current[part] === null) {
+             current[part] = nextPartIsIndex ? [] : {};
+        } else if (nextPartIsIndex && !Array.isArray(current[part])) {
+             throw new Error(`Cannot access index '${nextPart}' on non-array value at path '${path.slice(0, i+1).join('.')}'`);
+        } else if (!nextPartIsIndex && typeof current[part] !== 'object') {
+             throw new Error(`Cannot access property '${nextPart}' on non-object value at path '${path.slice(0, i+1).join('.')}'`);
         }
         current = current[part];
     }
-    current[path[path.length - 1]] = value;
+
+    const lastPart = path[path.length - 1];
+    if (lastPart === undefined || lastPart === null) {
+        throw new Error("Invalid final path segment");
+    }
+
+    if (/^\d+$/.test(lastPart) && !Array.isArray(current)) {
+         throw new Error(`Cannot assign to index '${lastPart}' on non-array value at path '${path.slice(0, -1).join('.')}'`);
+    }
+    current[lastPart] = value;
 }
+
 
 class Condition {
   private _db: Database;
@@ -129,8 +182,8 @@ class Condition {
     return this;
   }
 
-  async exec(): Promise<any[]> {
-    return this._db._queryAst(this._ast, this._projection);
+  async exec(limit?: number, offset?: number): Promise<any[]> {
+    return this._db._queryAst(this._ast, this._projection, limit, offset);
   }
 }
 
@@ -204,7 +257,7 @@ const collectionProxyHandler: ProxyHandler<{ db: Database; key: string }> = {
                 try {
                     currentDoc = await target.db.get(key) || {};
                 } catch (e: any) {
-                    if (e?.message?.includes("Key not found") || e?.message?.includes("HTTP error 404")) {
+                    if (e instanceof DatabaseError && e.code === 404) {
                          currentDoc = {};
                     } else {
                         console.error(`Error fetching document for set operation on key '${key}':`, e);
@@ -261,12 +314,17 @@ type GeoQueryBuilder = {
 
 export class Database {
   private baseURL: string;
+  private cache: Map<string, { value: any; timestamp: number }>;
+  private cacheTTL: number;
+  private subscriptions: { [key: string]: Array<() => void> };
+  private eventSource?: EventSource;
 
   constructor(config?: Partial<DatabaseConfig>) {
     const conf: DatabaseConfig = {
         host: config?.host ?? '127.0.0.1',
         port: config?.port ?? 8989,
         protocol: config?.protocol ?? 'http',
+        cacheTTL: config?.cacheTTL ?? 5000,
     };
 
     if (!conf.host) {
@@ -277,33 +335,83 @@ export class Database {
     }
 
     this.baseURL = `${conf.protocol}://${conf.host}:${conf.port}`;
+    this.cache = new Map();
+    this.cacheTTL = conf.cacheTTL ?? 5000;
+    this.subscriptions = {};
     console.info(`Database SDK initialized for server at: ${this.baseURL}`);
+    this.initializeEventSource(); // Uncommented this line
   }
 
-  private async _request<T>(endpoint: string, body: any): Promise<T> {
+  private initializeEventSource() {
+      try {
+          const eventsUrl = `${this.baseURL}/events`;
+          console.info(`Attempting to connect to SSE endpoint: ${eventsUrl}`);
+          this.eventSource = new EventSource(eventsUrl);
+
+          this.eventSource.onopen = () => {
+              console.info(`SSE connection established to ${eventsUrl}`);
+          };
+
+          this.eventSource.onerror = (error) => {
+              console.error(`SSE connection error to ${eventsUrl}:`, error);
+              this.eventSource?.close();
+
+              setTimeout(() => this.initializeEventSource(), 5000);
+          };
+
+          this.eventSource.addEventListener('update', (event) => {
+              try {
+                  console.debug('Received SSE update event:', event.data);
+                  const { key } = JSON.parse(event.data);
+                  if (key && this.subscriptions[key]) {
+                      console.debug(`Notifying subscribers for key: ${key}`);
+                      this.subscriptions[key]?.forEach(cb => cb());
+                  }
+              } catch (e) {
+                  console.error('Error processing SSE update event:', e);
+              }
+          });
+      } catch (error) {
+          console.error('Failed to initialize EventSource:', error);
+      }
+  }
+
+  private async _request<T>(endpoint: string, body: any, method: 'POST' | 'GET' = 'POST'): Promise<T> {
     const url = `${this.baseURL}/${endpoint}`;
-    console.debug(`Sending request to ${url}`, body);
+    const start = performance.now();
+    console.debug(`Sending ${method} request to ${url}`, method === 'POST' ? body : '');
     try {
       const response = await fetch(url, {
-        method: 'POST',
+        method: method,
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(body),
+        body: method === 'POST' ? JSON.stringify(body) : undefined,
       });
 
+      const duration = performance.now() - start;
+      console.log(`Request to ${endpoint} took ${duration.toFixed(2)}ms`);
       console.debug(`Received response ${response.status} from ${url}`);
+
+      // Special handling for /get 404: return undefined instead of throwing
+      if (endpoint === 'get' && response.status === 404) {
+          console.debug(`Key not found (404) for ${url}`);
+          return undefined as T;
+      }
 
       if (!response.ok) {
         let errorBody;
+        let errorMessage = `HTTP error ${response.status} on /${endpoint}`;
         try {
             errorBody = await response.json();
             console.error(`Error response body from ${url}:`, errorBody);
+            errorMessage = `Database Error (${response.status}): ${errorBody.error || JSON.stringify(errorBody)}`;
         } catch (e) {
             errorBody = await response.text();
             console.error(`Error response text from ${url}:`, errorBody);
+            errorMessage = `HTTP error ${response.status} on /${endpoint}: ${errorBody}`;
         }
-        throw new Error(`HTTP error ${response.status} on /${endpoint}: ${typeof errorBody === 'string' ? errorBody : JSON.stringify(errorBody)}`);
+        throw new DatabaseError(errorMessage, response.status);
       }
 
       if (response.status === 204 || response.headers.get('content-length') === '0') {
@@ -323,26 +431,84 @@ export class Database {
        }
 
     } catch (error) {
+      const duration = performance.now() - start;
+      console.log(`Request to ${endpoint} took ${duration.toFixed(2)}ms (failed)`);
       console.error(`Request failed for ${url}:`, error);
-      throw error;
+      if (error instanceof DatabaseError) {
+          throw error;
+      } else if (error instanceof Error) {
+          throw new DatabaseError(`Network or unexpected error for /${endpoint}: ${error.message}`, 0);
+      } else {
+          throw new DatabaseError(`Unknown error for /${endpoint}`, 0);
+      }
     }
   }
 
   async set(key: string, value: any): Promise<void> {
     await this._request<void>('set', { key, value });
+    this.cache.delete(key);
   }
 
-  async get(key: string): Promise<any> {
-    return this._request<any>('get', { key });
+  async get(key: string): Promise<any | undefined> {
+    const cached = this.cache.get(key);
+    if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
+      console.debug(`Cache hit for key: ${key}`);
+      return cached.value;
+    }
+    console.debug(`Cache miss for key: ${key}`);
+    // _request now returns undefined for 404 on /get
+    const value = await this._request<any | undefined>('get', { key });
+    if (value === undefined) {
+        // Explicitly throw the expected error type for the tests
+        throw new DatabaseError(`Database Error (404): Key not found`, 404);
+    }
+    this.cache.set(key, { value, timestamp: Date.now() });
+    return value;
   }
 
   async getPartial(key: string, fields: string[]): Promise<any> {
+    // Note: getPartial might also need 404 handling if the key itself doesn't exist
+    // For now, assume it throws if key not found, or returns partial if key exists but fields don't
     return this._request<any>('get_partial', { key, fields });
   }
 
   async delete(key: string): Promise<void> {
     await this._request<void>('delete', { key });
+    this.cache.delete(key);
   }
+
+  async batchSet(items: BatchSetItem[]): Promise<void> {
+      await this._request<void>('batch_set', items);
+      items.forEach(item => this.cache.delete(item.key));
+  }
+
+  async transaction(operations: TransactionOperation[]): Promise<void> {
+      await this._request<void>('transaction', operations);
+
+      operations.forEach(op => {
+          if (op.type === 'set' || op.type === 'delete') {
+              this.cache.delete(op.key);
+          }
+      });
+  }
+
+  async clearPrefix(prefix: string): Promise<number> {
+      const response = await this._request<CountResponse>('clear_prefix', { prefix });
+
+      this.cache.forEach((_, key) => {
+          if (key.startsWith(prefix)) {
+              this.cache.delete(key);
+          }
+      });
+      return response.count;
+  }
+
+  async dropDatabase(): Promise<number> {
+      const response = await this._request<CountResponse>('drop_database', {});
+      this.cache.clear();
+      return response.count;
+  }
+
 
   async queryRadius(payload: QueryRadiusPayload): Promise<any[]> {
      return this._request<any[]>('query/radius', payload);
@@ -356,36 +522,52 @@ export class Database {
       return this._request<any[]>('query/and', { conditions });
   }
 
-  async _queryAst(ast: AstNode, projection?: string[]): Promise<any[]> {
+  async _queryAst(ast: AstNode, projection?: string[], limit?: number, offset?: number): Promise<any[]> {
       const payload: QueryAstPayload = { ast };
       if (projection && projection.length > 0) {
           payload.projection = projection;
+      }
+      if (limit !== undefined) {
+          payload.limit = limit;
+      }
+      if (offset !== undefined) {
+          payload.offset = offset;
       }
       return this._request<any[]>('query/ast', payload);
   }
 
   async exportData(): Promise<string> {
-     const url = `${this.baseURL}/export`;
-     console.debug(`Sending request to ${url}`);
-     const response = await fetch(url);
-      if (!response.ok) {
-          console.error(`Error response ${response.status} from ${url}`);
-          throw new Error(`HTTP error ${response.status} on /export`);
-      }
-      const dataString = await response.json();
-      console.debug(`Received export data from ${url}`);
-      return dataString;
+     const dataString = await this._request<string>('export', null, 'GET');
+     return dataString;
   }
 
   async importData(data: ImportItem[]): Promise<void> {
     await this._request<void>('import', data);
+    this.cache.clear();
+  }
+
+  subscribe(key: string, callback: () => void): () => void {
+      this.subscriptions[key] ||= [];
+      this.subscriptions[key].push(callback);
+      console.debug(`Subscribed to key: ${key}`);
+
+      return () => {
+          const currentSubs = this.subscriptions[key];
+          if (currentSubs) {
+              this.subscriptions[key] = currentSubs.filter(cb => cb !== callback);
+              if (this.subscriptions[key].length === 0) {
+                  delete this.subscriptions[key];
+              }
+          }
+          console.debug(`Unsubscribed from key: ${key}`);
+      };
   }
 
   collection<T = any>(key: string): CollectionReference<T> {
     if (!key || typeof key !== 'string') {
         throw new Error("Collection key must be a non-empty string.");
     }
-    // Cast through unknown to satisfy TypeScript's strict checking for Proxy return types
+
     return new Proxy({ db: this, key }, collectionProxyHandler) as unknown as CollectionReference<T>;
   }
 }

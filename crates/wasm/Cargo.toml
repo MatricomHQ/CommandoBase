@@ -16,6 +16,9 @@ thiserror = "1.0" # For error handling consistency (optional here)
 tracing = "0.1"
 sled = "0.34.7" # Added sled dependency
 wasm-bindgen-futures = "0.4" # Add wasm-bindgen-futures for async support
+js-sys = "0.3" # Added js-sys
+tracing-wasm = "0.2" # Added tracing-wasm
+tracing-subscriber = { version = "0.3", features = ["fmt", "time"] } # Added tracing-subscriber with features
 
 [profile.release]
 lto = true

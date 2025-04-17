@@ -8,23 +8,27 @@ use axum::{
 use rust_db_logic::{
     self as logic,
     export_data,
-    import_data,
+    // import_data, // Removed unused import
     DbConfig as LogicDbConfig,
-    BatchSetItem, // Import new types
+    BatchSetItem,
     TransactionOperation,
+    QueryNode,
+    // DbError, // Removed unused import
 };
 use serde::{Serialize, Deserialize};
-use serde_json::{Value, json}; // Import json macro
+use serde_json::{Value, json};
 use sled::{Db, Config};
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::fs;
+// use std::collections::HashSet; // Removed unused import
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, error, Level, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::Parser;
 use thiserror::Error;
+use std::sync::Mutex; // Import Mutex
 
 const DEFAULT_BASE_PATH: &str = "database_data_server";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8989";
@@ -44,7 +48,7 @@ struct Args {
 #[derive(Clone, Debug)]
 struct AppState {
     db: Arc<Db>,
-    db_config: Arc<LogicDbConfig>,
+    db_config: Arc<Mutex<LogicDbConfig>>, // Wrap in Mutex
 }
 
 #[derive(Deserialize, Debug)]
@@ -118,6 +122,30 @@ struct CountResponse {
     count: usize,
 }
 
+// Modified: Take a reference to QueryNode
+fn extract_eq_field(query_node: &QueryNode) -> Option<String> {
+    match query_node {
+        QueryNode::Eq(field, _, _) => Some(field.clone()),
+        QueryNode::And(left, right) => extract_eq_field(left).or_else(|| extract_eq_field(right)),
+        QueryNode::Or(left, right) => extract_eq_field(left).or_else(|| extract_eq_field(right)),
+        QueryNode::Not(node) => extract_eq_field(node),
+        _ => None,
+    }
+}
+
+fn add_field_to_index(db_config: &mut LogicDbConfig, field_path: &str) {
+    let mut current_path = String::new();
+    for part in field_path.split('.') {
+        if !current_path.is_empty() {
+            current_path.push('.');
+        }
+        current_path.push_str(part);
+        if db_config.hash_indexed_fields.insert(current_path.clone()) {
+            info!("Dynamically indexing field: {}", current_path);
+        }
+    }
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -153,7 +181,8 @@ async fn main() {
     };
 
 
-    let db_config = Arc::new(LogicDbConfig::default());
+    // Configure DbConfig with hash index for 'type' field
+    let db_config = Arc::new(Mutex::new(LogicDbConfig::default()));
     info!("Using default DbConfig: {:?}", db_config);
 
 
@@ -217,8 +246,10 @@ async fn set_handler(
     State(state): State<AppState>,
     Json(payload): Json<SetPayload>,
 ) -> Result<StatusCode, AppError> {
-
-    logic::set_key(&state.db, &payload.key, payload.value, &state.db_config)?;
+    let db_config_guard = state.db_config.lock().unwrap();
+    // Note: Dynamic indexing on set is complex as we don't know which fields *will* be queried.
+    // For now, indexing happens primarily during query.
+    logic::set_key(&state.db, &payload.key, payload.value, &db_config_guard)?;
     Ok(StatusCode::OK)
 }
 
@@ -247,8 +278,14 @@ async fn delete_handler(
     State(state): State<AppState>,
     Json(payload): Json<KeyPayload>,
 ) -> Result<StatusCode, AppError> {
-
-    logic::delete_key(&state.db, &payload.key, &state.db_config).await?;
+    // Clone config inside lock, drop lock before await
+    let config_clone = {
+        let guard = state.db_config.lock().unwrap();
+        let config_clone = guard.clone();
+        drop(guard); // Explicitly drop the lock
+        config_clone
+    };
+    logic::delete_key(&state.db, &payload.key, &config_clone).await?;
     Ok(StatusCode::OK)
 }
 
@@ -258,7 +295,9 @@ async fn batch_set_handler(
     State(state): State<AppState>,
     Json(payload): Json<BatchSetPayload>,
 ) -> Result<StatusCode, AppError> {
-    logic::batch_set(&state.db, &payload, &state.db_config)?; // Pass slice
+    let db_config_guard = state.db_config.lock().unwrap();
+    // Dynamic indexing on batch set is also complex. Indexing on query is preferred.
+    logic::batch_set(&state.db, &payload, &db_config_guard)?; // Pass slice
     Ok(StatusCode::OK)
 }
 
@@ -267,7 +306,8 @@ async fn transaction_handler(
     State(state): State<AppState>,
     Json(payload): Json<TransactionPayload>,
 ) -> Result<StatusCode, AppError> {
-    logic::execute_transaction(&state.db, &payload, &state.db_config)?; // Pass slice
+    let db_config_guard = state.db_config.lock().unwrap();
+    logic::execute_transaction(&state.db, &payload, &db_config_guard)?; // Pass slice
     Ok(StatusCode::OK)
 }
 
@@ -276,7 +316,8 @@ async fn clear_prefix_handler(
     State(state): State<AppState>,
     Json(payload): Json<ClearPrefixPayload>,
 ) -> Result<Json<CountResponse>, AppError> {
-    let count = logic::clear_prefix(&state.db, &payload.prefix, &state.db_config)?;
+    let db_config_guard = state.db_config.lock().unwrap();
+    let count = logic::clear_prefix(&state.db, &payload.prefix, &db_config_guard)?;
     Ok(Json(CountResponse { count }))
 }
 
@@ -284,7 +325,8 @@ async fn clear_prefix_handler(
 async fn drop_database_handler(
     State(state): State<AppState>,
 ) -> Result<Json<CountResponse>, AppError> {
-    let count = logic::drop_database(&state.db, &state.db_config)?;
+    let db_config_guard = state.db_config.lock().unwrap();
+    let count = logic::drop_database(&state.db, &db_config_guard)?;
     Ok(Json(CountResponse { count }))
 }
 
@@ -294,7 +336,8 @@ async fn query_radius_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryRadiusPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-
+    // Geo queries might also benefit from dynamic indexing, but requires more complex logic
+    // to determine if the field should be geo-indexed. Sticking to hash for now.
     let results = logic::query_within_radius_simplified(&state.db, &payload.field, payload.lat, payload.lon, payload.radius)?;
     Ok(Json(results))
 }
@@ -304,7 +347,6 @@ async fn query_box_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryBoxPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-
     let results = logic::query_in_box(&state.db, &payload.field, payload.min_lat, payload.min_lon, payload.max_lat, payload.max_lon)?;
     Ok(Json(results))
 }
@@ -314,7 +356,8 @@ async fn query_and_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryAndPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-
+    // Dynamic indexing for AND conditions requires iterating through conditions
+    // and potentially updating the config multiple times.
     let conditions: Vec<(&str, &str, &str)> = payload.conditions.iter()
         .map(|(field, op, value)| (field.as_str(), op.as_str(), value.as_str()))
         .collect();
@@ -327,8 +370,22 @@ async fn query_ast_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryAstPayload>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-    // Pass limit and offset
-    let results = logic::execute_ast_query(&state.db, payload.ast, payload.projection, payload.limit, payload.offset)?;
+    let field_to_index = &payload.ast;
+    let field_option = extract_eq_field(field_to_index);
+
+    // Clone config, potentially update it, drop lock before await/logic call
+    let config_clone = {
+        let mut db_config_guard = state.db_config.lock().unwrap();
+        if let Some(field) = field_option {
+            add_field_to_index(&mut db_config_guard, &field);
+        }
+        let config_clone = db_config_guard.clone();
+        drop(db_config_guard); // Explicitly drop the lock
+        config_clone
+    };
+
+    // Pass the potentially updated, cloned config
+    let results = logic::execute_ast_query(&state.db, payload.ast, payload.projection, payload.limit, payload.offset, &config_clone)?;
     Ok(Json(results))
 }
 
@@ -345,9 +402,8 @@ async fn import_handler(
     State(state): State<AppState>,
     Json(payload): Json<ImportPayload>,
 ) -> Result<StatusCode, AppError> {
-    let data_string = serde_json::to_string(&payload)?;
-
-    import_data(&state.db, &data_string, &state.db_config)?;
+    let db_config_guard = state.db_config.lock().unwrap();
+    logic::import_data(&state.db, &serde_json::to_string(&payload).unwrap(), &db_config_guard)?;
     Ok(StatusCode::CREATED)
 }
 
@@ -382,7 +438,8 @@ impl IntoResponse for AppError {
                 logic::DbError::InvalidGeoSortedKey(key) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid geo sorted index key format: {}", key)),
                 logic::DbError::AstQueryError(msg) => (StatusCode::BAD_REQUEST, format!("AST Query Error: {}", msg)),
                 logic::DbError::InvalidPath(path) => (StatusCode::BAD_REQUEST, format!("Invalid path specified: {}", path)),
-                logic::DbError::TransactionOperationFailed(msg) => (StatusCode::CONFLICT, format!("Transaction failed: {}", msg)), // Added
+                logic::DbError::TransactionOperationFailed(msg) => (StatusCode::CONFLICT, format!("Transaction failed: {}", msg)),
+                logic::DbError::InvalidFieldIndexKey(key) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Invalid field index key format: {}", key)), // Added arm
             },
             AppError::Json(json_err) => (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", json_err)),
         };

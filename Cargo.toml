@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/logic",
-    "crates/wasm",
+#    "crates/wasm",
     "crates/server",
 ]
 

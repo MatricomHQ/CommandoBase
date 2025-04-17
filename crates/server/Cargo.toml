@@ -13,6 +13,6 @@ serde_json = "1.0.140"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sled = "0.34.7"
+sled = { version = "0.34.7", features = ["compression"] }
 geo = { version = "0.30.0", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] } # Added clap with derive and env features
